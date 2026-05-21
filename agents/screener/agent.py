@@ -4,7 +4,6 @@ from shared.config import config
 from azure.storage.blob import BlobServiceClient
 import pdfplumber
 import io
-import uuid
 
 def extract_text_from_pdf(pdf_bytes: bytes) -> str:
     """Extract text from PDF resume."""
@@ -16,17 +15,20 @@ def extract_text_from_pdf(pdf_bytes: bytes) -> str:
             return text
     except Exception as e:
         print(f"[SCREENER] PDF error: {e}")
-        return ""
+        # Try reading as plain text
+        try:
+            return pdf_bytes.decode("utf-8")
+        except Exception:
+            return ""
 
 def remove_bias(resume_text: str) -> str:
     """Remove identifying information from resume."""
     prompt = f"""
 Remove all personally identifying information from this resume.
 Replace or remove: full name, email, phone number, gender signals,
-religion signals, photo descriptions, university prestige markers,
-home address, social media links.
-Keep everything else exactly as is: skills, job titles, 
-years of experience, achievements, technical content.
+religion signals, university prestige markers, home address.
+Keep everything else: skills, job titles, years of experience,
+achievements, technical content.
 Return only the anonymized resume text. Nothing else.
 
 RESUME:
@@ -45,9 +47,9 @@ RESUME:
 {anonymized_text}
 
 Score the candidate on these dimensions (0-100 each):
-- technical_skills: How well do their skills match the job role
-- experience_depth: Quality and relevance of work experience
-- communication: Clarity and quality of resume writing
+- technical_skills: How well skills match the job role
+- experience_depth: Quality and relevance of experience
+- communication: Clarity of resume writing
 - overall_score: Final weighted score
 
 Also extract:
@@ -55,7 +57,7 @@ Also extract:
 - experience_years: Total years of relevant experience
 - strengths: Top 3 strengths
 - concerns: Any red flags or gaps
-- reasoning: 2 sentence explanation of the overall score
+- reasoning: 2 sentence explanation of overall score
 
 Return ONLY valid JSON. No markdown. No explanation outside JSON.
 
@@ -74,69 +76,68 @@ Return ONLY valid JSON. No markdown. No explanation outside JSON.
     response = ask_gpt4o_mini(prompt)
     return parse_json(response)
 
-def upload_resume_to_blob(pdf_bytes: bytes, candidate_id: str) -> str:
-    """Upload resume PDF to Azure Blob Storage."""
-    blob_service = BlobServiceClient.from_connection_string(
-        config.BLOB_CONNECTION
-    )
-    blob_name = f"{candidate_id}.pdf"
-    blob_client = blob_service.get_blob_client(
-        container=config.BLOB_CONTAINER,
-        blob=blob_name
-    )
-    blob_client.upload_blob(pdf_bytes, overwrite=True)
-    print(f"[SCREENER] Resume uploaded to blob: {blob_name}")
-    return blob_name
+def upload_resume_to_blob(pdf_bytes: bytes,
+                          candidate_id: str) -> str:
+    """Upload resume to Azure Blob Storage."""
+    try:
+        blob_service = BlobServiceClient.from_connection_string(
+            config.BLOB_CONNECTION
+        )
+        blob_name   = f"{candidate_id}.pdf"
+        blob_client = blob_service.get_blob_client(
+            container=config.BLOB_CONTAINER,
+            blob=blob_name
+        )
+        blob_client.upload_blob(pdf_bytes, overwrite=True)
+        print(f"[SCREENER] Resume uploaded: {blob_name}")
+        return blob_name
+    except Exception as e:
+        print(f"[SCREENER] Blob upload error: {e}")
+        return ""
 
 def run_screener(candidate_id: str,
                  pdf_bytes: bytes,
                  job_role: str) -> dict:
     """
     Main screener function.
-    1. Upload resume to Blob Storage
-    2. Extract text from PDF
-    3. Remove bias
-    4. Score candidate
-    5. Save to Cosmos DB
+    Works with both real PDFs and plain text.
     """
-    print(f"[SCREENER] Starting for candidate: {candidate_id}")
+    print(f"[SCREENER] Starting for: {candidate_id}")
 
-    # Step 1 - Upload to Blob Storage
-    blob_name = upload_resume_to_blob(pdf_bytes, candidate_id)
+    # Upload to Blob Storage
+    upload_resume_to_blob(pdf_bytes, candidate_id)
 
-    # Step 2 - Extract text
-    print(f"[SCREENER] Extracting text from PDF...")
+    # Extract text — handles both PDF and plain text
+    print(f"[SCREENER] Extracting text...")
     resume_text = extract_text_from_pdf(pdf_bytes)
 
-    if not resume_text:
-        print(f"[SCREENER] Could not extract text from PDF")
-        return {"error": "Could not read PDF"}
+    if not resume_text or len(resume_text.strip()) < 50:
+        print(f"[SCREENER] Could not extract text")
+        return {"error": "Could not read resume"}
 
     print(f"[SCREENER] Extracted {len(resume_text)} characters")
 
-    # Step 3 - Remove bias
+    # Remove bias
     print(f"[SCREENER] Removing bias...")
     anonymized = remove_bias(resume_text)
 
-    # Step 4 - Score resume
+    # Score resume
     print(f"[SCREENER] Scoring candidate...")
     result = score_resume(anonymized, job_role)
 
-    # Step 5 - Save to Cosmos DB
+    # Save to Cosmos DB
     update_candidate(candidate_id, {
-        "resume_blob": blob_name,
-        "resume_score": result["overall_score"],
-        "skills": result["skills"],
+        "resume_score":    result["overall_score"],
+        "skills":          result["skills"],
         "experience_years": result["experience_years"],
-        "status": "screened"
+        "status":          "screened"
     })
 
-    # Write audit trail
     write_audit(candidate_id, "SCREENER", "resume_scored", {
-        "score": result["overall_score"],
+        "score":        result["overall_score"],
         "bias_removed": True,
-        "reasoning": result["reasoning"]
+        "reasoning":    result["reasoning"]
     })
 
-    print(f"[SCREENER] Done. Score: {result['overall_score']}/100")
+    print(f"[SCREENER] Score: {result['overall_score']}/100")
     return result
