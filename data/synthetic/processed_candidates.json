@@ -1,0 +1,37 @@
+[
+  {
+    "id": "38c1242a-d89a-4b57-b3d3-1e0cc0826137",
+    "name": "Arjun Mehta",
+    "profile_type": "strong"
+  },
+  {
+    "id": "64e1ac55-d8ed-4f42-967b-f4be89d1d8e8",
+    "name": "Priya Sharma",
+    "profile_type": "strong"
+  },
+  {
+    "id": "eb4dad67-4401-4358-a8f2-dcdddf627629",
+    "name": "Rahul Verma",
+    "profile_type": "strong"
+  },
+  {
+    "id": "6b36dd36-6675-497d-be07-e1dd0b979478",
+    "name": "Sneha Patel",
+    "profile_type": "borderline"
+  },
+  {
+    "id": "f1d416d4-e14e-4421-9ff8-fa5c731e2978",
+    "name": "Karan Singh",
+    "profile_type": "borderline"
+  },
+  {
+    "id": "d50adb76-9daf-4b44-b78d-18b4bd28eced",
+    "name": "Ravi Kumar",
+    "profile_type": "reject"
+  },
+  {
+    "id": "064e70d9-674f-4840-bdc3-39156365a0ac",
+    "name": "Deepa Nair",
+    "profile_type": "reject"
+  }
+]
