@@ -70,12 +70,15 @@ print("TEST 1: JD Quality Scorer")
 print("=" * 55)
 
 bad_jd = """
-We need a rockstar Python developer with 10 years
-experience. Must know every framework. Must be
-available 24/7. Must have worked at FAANG.
-No salary provided. 25 requirements listed.
+We need an exceptional Python developer with 10 plus years
+experience in every framework ever created.
+Must be available around the clock.
+Must have Fortune 500 experience only.
+No salary range provided.
+Requires 25 different skills listed below.
+Must have PhD from top university only.
+Age preference 22 to 28 years.
 """
-
 from agents.interviewer.jd_quality_scorer import score_job_description
 jd_result = score_job_description(bad_jd)
 
