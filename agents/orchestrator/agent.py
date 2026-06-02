@@ -91,8 +91,32 @@ def run_ai_pipeline(candidate_id: str,
             "resume_score": resume_score
         }
 
-    # ── STAGE 2: AI Interview ────────────────────────────────────
-    print(f"[ORCH] Stage 2: AI Interview")
+ 
+# ── STAGE 2: Send AI Interview Link ──────────────────────────
+    print(f"[ORCH] Stage 2: Sending AI Interview Link")
+
+    # Send interview link to candidate email
+    try:
+        import requests
+        requests.post("http://localhost:8000/api/send-interview-link",
+            data={"candidate_id": candidate_id})
+        print(f"[ORCH] AI Interview link sent to candidate")
+    except Exception as e:
+        print(f"[ORCH] Could not send interview link: {e}")
+
+    # Still run AI interview in background for scoring
+    candidate   = get_candidate(candidate_id)
+    resume_text = _get_resume_text(pdf_bytes)
+
+    interview_result = run_ai_interview(
+        candidate_id, resume_text, jd_text
+    )
+
+    ai_score = interview_result.get("score", 0)
+    print(f"[ORCH] AI Interview score: {ai_score}/100")
+
+    combined_ai = (resume_score * 0.4) + (ai_score * 0.6)
+    print(f"[ORCH] Combined AI score: {combined_ai:.1f}/100")
 
     candidate   = get_candidate(candidate_id)
     resume_text = _get_resume_text(pdf_bytes)

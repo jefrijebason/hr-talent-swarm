@@ -8,13 +8,35 @@ import BrowsePage from './pages/BrowsePage';
 import JobDetailPage from './pages/JobDetailPage';
 import ApplyPage from './pages/ApplyPage';
 import TrackPage from './pages/TrackPage';
+import InterviewPage from './interview/InterviewPage';
 
 export default function App() {
-  const [page, setPage]       = useState('browse');
-  const [selectedJob, setJob] = useState(null);
+  const [page, setPage]             = useState('browse');
+  const [selectedJob, setJob]       = useState(null);
   const [successData, setSuccessData] = useState(null);
+  const [interviewData, setInterviewData] = useState(null);
 
-  // page transition variants
+  // Check URL for interview token on load
+  useEffect(() => {
+    const params = new URLSearchParams(window.location.search);
+    const token = params.get('interview');
+    const name  = params.get('name') || 'Candidate';
+    const role  = params.get('role') || 'this role';
+    const rounds = parseInt(params.get('rounds')) || 3;
+
+    if (token) {
+      setInterviewData({
+        token,
+        candidateName: decodeURIComponent(name),
+        roleName: decodeURIComponent(role),
+        roundsTotal: rounds,
+        resumeCount: 0,
+        currentRound: 1,
+      });
+      setPage('interview');
+    }
+  }, []);
+
   const pageVariants = {
     initial: { opacity: 0, y: 16 },
     animate: { opacity: 1, y: 0 },
@@ -35,6 +57,19 @@ export default function App() {
     setTimeout(() => confetti({ particleCount: 50, angle: 120,
       spread: 55, origin: { x: 1 }, colors }), 400);
   };
+
+  // Interview page has its own layout — no nav
+  if (page === 'interview' && interviewData) {
+    return (
+      <InterviewPage
+        candidateName={interviewData.candidateName}
+        roleName={interviewData.roleName}
+        roundsTotal={interviewData.roundsTotal}
+        resumeCount={interviewData.resumeCount}
+        currentRound={interviewData.currentRound}
+      />
+    );
+  }
 
   return (
     <div style={{ minHeight: '100vh', position: 'relative',
@@ -136,7 +171,7 @@ function SuccessPage({ data, onTrack, onBrowse }) {
           </div>
           {[
             '🤖 AI reviews your resume within 1 hour',
-            '🎯 AI interview scheduled automatically',
+            '🎯 AI interview link sent to your email',
             '👤 Human interview if shortlisted',
             '📧 Offer or detailed feedback within 3 days',
           ].map((s, i) => (
