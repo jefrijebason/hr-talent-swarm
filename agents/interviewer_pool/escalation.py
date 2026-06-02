@@ -3,32 +3,37 @@ from shared.cosmos_client import (
     get_interviewer, get_candidate,
     get_job, get_hr_user,
     add_assignment_timeline,
-    save_assignment
+    save_assignment, update_candidate,
+    update_interviewer
 )
 from shared.openai_client import ask_gpt4o_mini, parse_json
+from shared.config import config
 from agents.communicator.agent import send_email
 from datetime import datetime, timedelta
 import uuid
 
-# ── Escalation Timings ───────────────────────────────────────────
-DEFAULT_RESPONSE_HRS    = 2
-DEFAULT_ESCALATION_HRS  = 2
-DEFAULT_HR_ALERT_HRS    = 5
+# ── Escalation Timings (hours) ───────────────────────────────────
+DEFAULT_RESPONSE_HRS   = 2
+DEFAULT_ESCALATION_HRS = 2
+DEFAULT_HR_ALERT_HRS   = 5
+
+def _base_url() -> str:
+    return getattr(config, 'PUBLIC_URL', 'http://localhost:8000')
 
 def create_assignment(candidate_id: str,
                        job_id: str,
                        hr_id: str,
                        match_result: dict,
                        interview_type: str = "technical") -> dict:
-    """
-    Create interview assignment with full escalation chain.
-    """
+    """Create interview assignment with full escalation chain."""
     now = datetime.utcnow()
 
-    # Get job SLA config
     job = get_job(job_id)
-    response_hrs   = job.get("primary_response_hrs", DEFAULT_RESPONSE_HRS) if job else DEFAULT_RESPONSE_HRS
-    escalation_hrs = job.get("escalation_response_hrs", DEFAULT_ESCALATION_HRS) if job else DEFAULT_ESCALATION_HRS
+    response_hrs = job.get("primary_response_hrs", DEFAULT_RESPONSE_HRS) if job else DEFAULT_RESPONSE_HRS
+
+    primary  = match_result.get("primary")
+    backup_1 = match_result.get("backup_1")
+    backup_2 = match_result.get("backup_2")
 
     assignment = {
         "id":               str(uuid.uuid4()),
@@ -36,20 +41,20 @@ def create_assignment(candidate_id: str,
         "job_id":           job_id,
         "hr_id":            hr_id,
         "interview_type":   interview_type,
-        "primary_interviewer_id": match_result.get("primary", {}).get("id") if match_result.get("primary") else None,
-        "backup_1_id":      match_result.get("backup_1", {}).get("id") if match_result.get("backup_1") else None,
-        "backup_2_id":      match_result.get("backup_2", {}).get("id") if match_result.get("backup_2") else None,
-        "assigned_to":      match_result.get("primary", {}).get("id") if match_result.get("primary") else None,
+        "primary_interviewer_id": primary.get("id") if primary else None,
+        "backup_1_id":      backup_1.get("id") if backup_1 else None,
+        "backup_2_id":      backup_2.get("id") if backup_2 else None,
+        "assigned_to":      primary.get("id") if primary else None,
         "status":           "pending",
         "escalation_level": 0,
         "created_at":       now.isoformat(),
         "response_deadline": (now + timedelta(hours=response_hrs)).isoformat(),
         "hr_alerted":       False,
         "feedback_submitted": False,
-        "timeline":         [{
+        "timeline": [{
             "time":   now.isoformat(),
             "event":  "assignment_created",
-            "detail": f"Primary: {match_result.get('primary', {}).get('name', 'None') if match_result.get('primary') else 'None'}"
+            "detail": f"Primary: {primary.get('name', 'None') if primary else 'None'}"
         }]
     }
 
@@ -58,10 +63,8 @@ def create_assignment(candidate_id: str,
     return assignment
 
 def send_interview_request(assignment_id: str) -> bool:
-    """
-    Send interview request to currently assigned interviewer.
-    """
-    assignment  = get_assignment(assignment_id)
+    """Send interview request to currently assigned interviewer."""
+    assignment = get_assignment(assignment_id)
     if not assignment:
         return False
 
@@ -71,25 +74,23 @@ def send_interview_request(assignment_id: str) -> bool:
 
     interviewer = get_interviewer(interviewer_id)
     candidate   = get_candidate(assignment["candidate_id"])
-    job         = get_job(assignment["job_id"])
 
     if not interviewer or not candidate:
         return False
 
-    # Get HR who posted the job
     hr = get_hr_user(assignment.get("hr_id", ""))
     hr_name  = hr.get("name", "HR Team") if hr else "HR Team"
     hr_email = hr.get("email", "") if hr else ""
 
-    # Build AI briefing
     ai_profile  = candidate.get("ai_profile", {})
     briefing    = ai_profile.get("human_interview_briefing", {})
     focus_on    = briefing.get("focus_on", [])
     do_not_test = briefing.get("do_not_test_again", [])
     suggestions = briefing.get("suggested_questions", [])
 
-    accept_url  = f"http://localhost:8000/api/assignments/{assignment_id}/accept"
-    decline_url = f"http://localhost:8000/api/assignments/{assignment_id}/decline"
+    base_url    = _base_url()
+    accept_url  = f"{base_url}/api/assignments/{assignment_id}/accept"
+    decline_url = f"{base_url}/api/assignments/{assignment_id}/decline"
 
     prompt = f"""
 Write a professional interview request email to an interviewer.
@@ -117,7 +118,7 @@ RESPONSE DEADLINE: 2 hours
 
 Write a clear professional email.
 Include all briefing details.
-Include ACCEPT and DECLINE buttons clearly.
+Include ACCEPT and DECLINE buttons clearly as HTML links.
 Duration: 45 minutes.
 
 Return ONLY valid JSON:
@@ -140,12 +141,11 @@ Return ONLY valid JSON:
 
         if sent:
             update_assignment(assignment_id, {
-                "status":     "invited",
+                "status":      "invited",
                 "assigned_at": datetime.utcnow().isoformat()
             })
             add_assignment_timeline(
-                assignment_id,
-                "invitation_sent",
+                assignment_id, "invitation_sent",
                 f"Email sent to {interviewer['name']} ({interviewer['email']})"
             )
             print(f"[PIS] Invitation sent to {interviewer['name']}")
@@ -157,15 +157,7 @@ Return ONLY valid JSON:
         return False
 
 def check_and_escalate(assignment_id: str) -> dict:
-    """
-    Check if response deadline passed.
-    Escalate to next level if needed.
-    Solves all drawbacks:
-    - Parallel notification option
-    - HR delegate chain
-    - Candidate proactive updates
-    - SLA tracking
-    """
+    """Check deadline and escalate to next level if needed."""
     assignment = get_assignment(assignment_id)
     if not assignment:
         return {"status": "not_found"}
@@ -183,12 +175,8 @@ def check_and_escalate(assignment_id: str) -> dict:
 
     if now < deadline:
         remaining = (deadline - now).seconds // 60
-        return {
-            "status":          "waiting",
-            "minutes_remaining": remaining
-        }
+        return {"status": "waiting", "minutes_remaining": remaining}
 
-    # Deadline passed — escalate
     level = assignment.get("escalation_level", 0)
     print(f"[PIS] Deadline passed. Escalation level: {level}")
 
@@ -201,11 +189,9 @@ def check_and_escalate(assignment_id: str) -> dict:
     else:
         return {"status": "max_escalation_reached"}
 
-def _escalate_to_backup1(assignment_id: str,
-                          assignment: dict) -> dict:
+def _escalate_to_backup1(assignment_id: str, assignment: dict) -> dict:
     """Escalate to backup 1."""
     backup_id = assignment.get("backup_1_id")
-
     if not backup_id:
         return _alert_hr(assignment_id, assignment)
 
@@ -214,18 +200,15 @@ def _escalate_to_backup1(assignment_id: str,
         return _alert_hr(assignment_id, assignment)
 
     job = get_job(assignment["job_id"])
-    escalation_hrs = job.get("escalation_response_hrs",
-                              DEFAULT_ESCALATION_HRS) if job else DEFAULT_ESCALATION_HRS
+    escalation_hrs = job.get("escalation_response_hrs", DEFAULT_ESCALATION_HRS) if job else DEFAULT_ESCALATION_HRS
 
-    # Notify original that they were skipped
     _notify_skipped_interviewer(assignment, level=0)
 
     update_assignment(assignment_id, {
         "assigned_to":       backup_id,
         "escalation_level":  1,
         "status":            "pending",
-        "response_deadline": (datetime.utcnow() +
-            timedelta(hours=escalation_hrs)).isoformat()
+        "response_deadline": (datetime.utcnow() + timedelta(hours=escalation_hrs)).isoformat()
     })
 
     add_assignment_timeline(
@@ -233,22 +216,16 @@ def _escalate_to_backup1(assignment_id: str,
         f"Primary did not respond. Escalated to {backup['name']}"
     )
 
-    # Update candidate
     _update_candidate_status(assignment["candidate_id"],
         "Your interview is being scheduled. Confirmation soon.")
 
-    # Send to backup
     send_interview_request(assignment_id)
-
     print(f"[PIS] Escalated to backup 1: {backup['name']}")
-    return {"status": "escalated_to_backup1",
-            "interviewer": backup["name"]}
+    return {"status": "escalated_to_backup1", "interviewer": backup["name"]}
 
-def _escalate_to_backup2(assignment_id: str,
-                          assignment: dict) -> dict:
+def _escalate_to_backup2(assignment_id: str, assignment: dict) -> dict:
     """Escalate to backup 2."""
     backup_id = assignment.get("backup_2_id")
-
     if not backup_id:
         return _alert_hr(assignment_id, assignment)
 
@@ -257,8 +234,7 @@ def _escalate_to_backup2(assignment_id: str,
         return _alert_hr(assignment_id, assignment)
 
     job = get_job(assignment["job_id"])
-    escalation_hrs = job.get("escalation_response_hrs",
-                              DEFAULT_ESCALATION_HRS) if job else DEFAULT_ESCALATION_HRS
+    escalation_hrs = job.get("escalation_response_hrs", DEFAULT_ESCALATION_HRS) if job else DEFAULT_ESCALATION_HRS
 
     _notify_skipped_interviewer(assignment, level=1)
 
@@ -266,8 +242,7 @@ def _escalate_to_backup2(assignment_id: str,
         "assigned_to":       backup_id,
         "escalation_level":  2,
         "status":            "pending",
-        "response_deadline": (datetime.utcnow() +
-            timedelta(hours=escalation_hrs)).isoformat()
+        "response_deadline": (datetime.utcnow() + timedelta(hours=escalation_hrs)).isoformat()
     })
 
     add_assignment_timeline(
@@ -279,17 +254,11 @@ def _escalate_to_backup2(assignment_id: str,
         "We are prioritizing your interview scheduling.")
 
     send_interview_request(assignment_id)
-
     print(f"[PIS] Escalated to backup 2: {backup['name']}")
-    return {"status": "escalated_to_backup2",
-            "interviewer": backup["name"]}
+    return {"status": "escalated_to_backup2", "interviewer": backup["name"]}
 
-def _alert_hr(assignment_id: str,
-               assignment: dict) -> dict:
-    """
-    All interviewers failed — alert the HR who posted the JD.
-    Give HR options to resolve.
-    """
+def _alert_hr(assignment_id: str, assignment: dict) -> dict:
+    """All interviewers failed — alert the HR who posted the JD."""
     hr_id = assignment.get("hr_id")
     hr    = get_hr_user(hr_id) if hr_id else None
 
@@ -298,9 +267,7 @@ def _alert_hr(assignment_id: str,
         return {"status": "no_hr_found"}
 
     candidate = get_candidate(assignment["candidate_id"])
-    job       = get_job(assignment["job_id"])
 
-    # Get all interviewers that were tried
     tried = []
     for key in ["primary_interviewer_id", "backup_1_id", "backup_2_id"]:
         iid = assignment.get(key)
@@ -309,8 +276,9 @@ def _alert_hr(assignment_id: str,
             if iv:
                 tried.append(iv["name"])
 
-    custom_assign_url = f"http://localhost:8000/api/assignments/{assignment_id}/custom-assign"
-    extend_url        = f"http://localhost:8000/api/assignments/{assignment_id}/extend"
+    base_url          = _base_url()
+    custom_assign_url = f"{base_url}/api/assignments/{assignment_id}/custom-assign"
+    extend_url        = f"{base_url}/api/assignments/{assignment_id}/extend"
 
     prompt = f"""
 Write an URGENT email to an HR manager.
@@ -345,7 +313,7 @@ Return ONLY valid JSON:
         response   = ask_gpt4o_mini(prompt)
         email_data = parse_json(response)
 
-        sent = send_email(
+        send_email(
             to_address=hr["email"],
             subject=email_data.get("subject",
                 f"⚠️ Action Required: Interview not scheduled for {candidate['name']}"),
@@ -364,7 +332,6 @@ Return ONLY valid JSON:
             f"All interviewers unavailable. HR {hr['name']} alerted."
         )
 
-        # Send candidate a reassuring update
         _update_candidate_status(
             assignment["candidate_id"],
             "Our HR team is personally handling your interview scheduling. "
@@ -381,16 +348,13 @@ Return ONLY valid JSON:
 def handle_custom_assign(assignment_id: str,
                           custom_email: str,
                           custom_name: str) -> bool:
-    """
-    HR manually assigns a custom interviewer.
-    Sends them invitation and adds them to pool.
-    """
+    """HR manually assigns a custom interviewer."""
     assignment = get_assignment(assignment_id)
     candidate  = get_candidate(assignment["candidate_id"])
-    job        = get_job(assignment["job_id"])
 
-    accept_url  = f"http://localhost:8000/api/assignments/{assignment_id}/accept"
-    decline_url = f"http://localhost:8000/api/assignments/{assignment_id}/decline"
+    base_url    = _base_url()
+    accept_url  = f"{base_url}/api/assignments/{assignment_id}/accept"
+    decline_url = f"{base_url}/api/assignments/{assignment_id}/decline"
 
     prompt = f"""
 Write a personal interview invitation email.
@@ -429,10 +393,8 @@ Return ONLY valid JSON:
                 "custom_assignee_name":  custom_name,
                 "assigned_to":           f"custom_{custom_email}",
                 "status":                "invited",
-                "response_deadline": (datetime.utcnow() +
-                    timedelta(hours=4)).isoformat()
+                "response_deadline": (datetime.utcnow() + timedelta(hours=4)).isoformat()
             })
-
             add_assignment_timeline(
                 assignment_id, "custom_assigned",
                 f"HR manually assigned: {custom_name} ({custom_email})"
@@ -445,14 +407,11 @@ Return ONLY valid JSON:
         return False
 
 def handle_acceptance(assignment_id: str) -> bool:
-    """
-    Interviewer accepted. Schedule meeting. Notify candidate.
-    """
-    assignment  = get_assignment(assignment_id)
-    candidate   = get_candidate(assignment["candidate_id"])
+    """Interviewer accepted. Schedule meeting. Notify candidate."""
+    assignment     = get_assignment(assignment_id)
+    candidate      = get_candidate(assignment["candidate_id"])
     interviewer_id = assignment.get("assigned_to", "")
 
-    # Get interviewer (could be custom)
     if interviewer_id.startswith("custom_"):
         interviewer_name  = assignment.get("custom_assignee_name", "Interviewer")
         interviewer_email = assignment.get("custom_assignee_email", "")
@@ -461,21 +420,19 @@ def handle_acceptance(assignment_id: str) -> bool:
         interviewer_name  = iv["name"] if iv else "Interviewer"
         interviewer_email = iv["email"] if iv else ""
 
-    # Schedule Teams meeting
     from agents.scheduler.agent import run_scheduler
     try:
-        slot = run_scheduler(assignment["candidate_id"],
-                              assignment["interview_type"])
-        meeting_url  = slot.get("meeting_url", "")
-        slot_human   = slot.get("slot_human", "")
+        slot = run_scheduler(assignment["candidate_id"], assignment["interview_type"])
+        meeting_url = slot.get("meeting_url", "")
+        slot_human  = slot.get("slot_human", "")
     except Exception:
         meeting_url = "https://teams.microsoft.com/demo"
         slot_human  = "To be confirmed"
 
     update_assignment(assignment_id, {
-        "status":       "accepted",
-        "accepted_at":  datetime.utcnow().isoformat(),
-        "meeting_url":  meeting_url,
+        "status":             "accepted",
+        "accepted_at":        datetime.utcnow().isoformat(),
+        "meeting_url":        meeting_url,
         "meeting_slot_human": slot_human
     })
 
@@ -484,20 +441,15 @@ def handle_acceptance(assignment_id: str) -> bool:
         f"{interviewer_name} accepted the interview"
     )
 
-    # Notify candidate with meeting details
     _send_candidate_confirmation(
-        assignment["candidate_id"],
-        interviewer_name,
-        slot_human,
-        meeting_url,
+        assignment["candidate_id"], interviewer_name,
+        slot_human, meeting_url,
         candidate.get("applied_role", "")
     )
 
-    # Update interviewer load
     if not interviewer_id.startswith("custom_"):
         iv = get_interviewer(interviewer_id)
         if iv:
-            from shared.cosmos_client import update_interviewer
             update_interviewer(interviewer_id, {
                 "current_booked": iv.get("current_booked", 0) + 1
             })
@@ -514,7 +466,6 @@ def _notify_skipped_interviewer(assignment: dict, level: int):
 
     iv        = get_interviewer(iid)
     candidate = get_candidate(assignment["candidate_id"])
-
     if not iv or not candidate:
         return
 
@@ -551,7 +502,6 @@ get this scheduled as quickly as possible.</p>
 <p>HR Team</p>
 """
         )
-        from shared.cosmos_client import update_candidate
         update_candidate(candidate_id, {
             "last_candidate_update": datetime.utcnow().isoformat()
         })
@@ -565,7 +515,6 @@ def _send_candidate_confirmation(candidate_id: str,
                                   role: str):
     """Send interview confirmation to candidate."""
     candidate = get_candidate(candidate_id)
-
     try:
         send_email(
             to_address=candidate["email"],

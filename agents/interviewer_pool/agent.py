@@ -1,3 +1,4 @@
+from shared.config import config
 from shared.cosmos_client import (
     save_interviewer, get_interviewer,
     get_interviewer_by_email,
@@ -38,8 +39,9 @@ def add_interviewer(name: str,
         return existing
 
     invite_token = secrets.token_urlsafe(32)
-    accept_url   = f"http://localhost:8000/api/interviewers/onboard/{invite_token}"
-    decline_url  = f"http://localhost:8000/api/interviewers/decline/{invite_token}"
+    base_url     = getattr(config, 'PUBLIC_URL', 'http://localhost:8000')
+    accept_url   = f"{base_url}/api/interviewers/onboard/{invite_token}"
+    decline_url  = f"{base_url}/api/interviewers/decline/{invite_token}"
 
     interviewer = {
         "id":               str(uuid.uuid4()),
