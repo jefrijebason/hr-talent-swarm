@@ -43,9 +43,11 @@ def save_job(job: dict):
     print(f"[DB] Job saved: {job['id']}")
 
 def get_job(job_id: str) -> dict:
+    if not job_id:
+        return None
     try:
         return col("jobs").read_item(job_id, partition_key=job_id)
-    except exceptions.CosmosResourceNotFoundError:
+    except Exception:
         return None
 
 def update_job(job_id: str, updates: dict) -> dict:
@@ -67,9 +69,11 @@ def save_hr_user(hr: dict):
     print(f"[DB] HR user saved: {hr['id']}")
 
 def get_hr_user(hr_id: str) -> dict:
+    if not hr_id:
+        return None
     try:
         return col("hr_users").read_item(hr_id, partition_key=hr_id)
-    except exceptions.CosmosResourceNotFoundError:
+    except Exception:
         return None
 
 def get_hr_by_email(email: str) -> dict:

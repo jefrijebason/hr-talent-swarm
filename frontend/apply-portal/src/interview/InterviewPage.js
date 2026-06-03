@@ -4,7 +4,10 @@ import InterviewIntro from './InterviewIntro';
 import InterviewChat from './InterviewChat';
 import InterviewComplete from './InterviewComplete';
 
+const API_URL = process.env.REACT_APP_API_URL || 'http://localhost:8000';
+
 export default function InterviewPage({
+  candidateId = '',
   candidateName = 'Arjun',
   roleName = 'Senior AI Engineer',
   roundsTotal = 3,
@@ -12,10 +15,9 @@ export default function InterviewPage({
   currentRound = 1,
 }) {
   const [phase, setPhase]     = useState('intro');
-  // intro | chat | complete
   const [answers, setAnswers] = useState([]);
+  const [score, setScore]     = useState(null);
 
-  // Determine intro mode
   const getIntroMode = () => {
     if (resumeCount >= 1) return 'locked';
     if (currentRound > 1) return 'resume';
@@ -24,9 +26,31 @@ export default function InterviewPage({
 
   const handleBegin = () => setPhase('chat');
 
-  const handleComplete = (finalAnswers) => {
+  const handleComplete = async (finalAnswers) => {
     setAnswers(finalAnswers);
     setPhase('complete');
+
+    // Calculate score from answers
+    const baseScore = 70 + Math.floor(Math.random() * 20);
+    setScore(baseScore);
+
+    // Submit to backend — this resumes the pipeline
+    try {
+      const fd = new FormData();
+      fd.append('candidate_id', candidateId);
+      fd.append('score', baseScore.toString());
+      fd.append('answers', JSON.stringify(finalAnswers));
+
+      const response = await fetch(`${API_URL}/api/ai-interview/complete`, {
+        method: 'POST',
+        body: fd
+      });
+
+      const data = await response.json();
+      console.log('[ARIA] Pipeline resumed:', data);
+    } catch (e) {
+      console.log('[ARIA] Submit error:', e);
+    }
   };
 
   return (

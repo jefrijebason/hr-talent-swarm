@@ -12,6 +12,7 @@ import InterviewPage from './interview/InterviewPage';
 
 export default function App() {
   const [page, setPage]             = useState('browse');
+  const [trackId, setTrackId] = useState('');
   const [selectedJob, setJob]       = useState(null);
   const [successData, setSuccessData] = useState(null);
   const [interviewData, setInterviewData] = useState(null);
@@ -102,11 +103,11 @@ export default function App() {
                 onSuccess={goSuccess} />
             )}
 
-            {page === 'track' && <TrackPage />}
+            {page === 'track' && <TrackPage initialQuery={trackId} />}
 
             {page === 'success' && successData && (
               <SuccessPage data={successData}
-                onTrack={() => setPage('track')}
+                onTrack={(id) => { setTrackId(id || ''); setPage('track'); }}
                 onBrowse={() => { setPage('browse'); setJob(null); }} />
             )}
 
@@ -188,7 +189,7 @@ function SuccessPage({ data, onTrack, onBrowse }) {
       </motion.div>
 
       <div style={{ display: 'flex', gap: '12px', justifyContent: 'center' }}>
-        <AuroraButton onClick={onTrack}>Track My Application →</AuroraButton>
+        <AuroraButton onClick={() => onTrack(trackingId)}>Track My Application →</AuroraButton>
         <AuroraButton variant="ghost" onClick={onBrowse}>Browse More Jobs</AuroraButton>
       </div>
     </div>

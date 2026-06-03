@@ -1,4 +1,4 @@
-import React, { useState } from 'react';
+import React, { useState, useEffect, useRef } from 'react';
 import { motion } from 'framer-motion';
 import axios from 'axios';
 import { theme, fonts } from '../theme';
@@ -6,74 +6,269 @@ import { GlassCard, AuroraButton, GradientText, GlassInput } from '../components
 
 const API_URL = process.env.REACT_APP_API_URL || 'http://localhost:8000';
 
-const STAGES = [
-  { key: 'applied',   label: 'Application Received', icon: '📥' },
-  { key: 'screened',  label: 'Resume Screened',      icon: '🔍' },
-  { key: 'ai',        label: 'AI Interview',         icon: '🤖' },
-  { key: 'technical', label: 'Technical Interview',  icon: '👤' },
-  { key: 'decision',  label: 'Final Decision',       icon: '🎯' },
-];
+// ── Build dynamic stages from job config + candidate status ──────
+function buildStages(candidate, job) {
+  const status = candidate?.status || 'applied';
+  const mode   = job?.interview_mode || 'standard';
+  const stages = [];
 
-function getStageIndex(status) {
-  if (!status) return 0;
-  if (status === 'applied') return 0;
-  if (status === 'screened') return 1;
-  if (status.includes('ai_interview')) return 2;
-  if (status.includes('technical') || status.includes('waiting_technical')) return 3;
-  if (status.includes('hr') || status.includes('waiting_hr')) return 3;
-  if (status === 'hired' || status === 'rejected') return 4;
-  return 1;
+  // Stage 1 — Always: Applied
+  stages.push({
+    key: 'applied', label: 'Application Received', icon: '📥',
+    statuses: ['applied']
+  });
+
+  // Stage 2 — Always: Screened
+  stages.push({
+    key: 'screened', label: 'Resume Screened', icon: '🔍',
+    statuses: ['screened']
+  });
+
+  // Mode-specific stages
+  if (mode === 'executive') {
+    // Executive: Skip AI, go straight to human rounds
+    const humanRounds = job?.human_rounds || [];
+    humanRounds.forEach((r, i) => {
+      stages.push({
+        key: `human_round_${i + 1}`,
+        label: r.round_name || `Round ${i + 1}`,
+        icon: '👤',
+        statuses: [`waiting_round_${i + 1}`, `round_${i + 1}_complete`]
+      });
+    });
+    if (humanRounds.length === 0) {
+      stages.push({
+        key: 'human_interview', label: 'Interview', icon: '👤',
+        statuses: ['waiting_technical_interview', 'waiting_hr_interview']
+      });
+    }
+  } else if (mode === 'express') {
+    // Express: AI Interview → Single Combined Human Round
+    if (job?.ai_interview_enabled !== false) {
+      stages.push({
+        key: 'ai_interview', label: 'AI Interview', icon: '🤖',
+        statuses: ['ai_interview_sent', 'ai_interview_accepted',
+                   'ai_interview_in_progress', 'ai_interview_complete']
+      });
+    }
+    stages.push({
+      key: 'combined_interview', label: 'Combined Interview', icon: '👤',
+      statuses: ['waiting_technical_interview', 'waiting_hr_interview']
+    });
+  } else if (mode === 'custom') {
+    // Custom: Build from job config
+    if (job?.ai_interview_enabled !== false) {
+      stages.push({
+        key: 'ai_interview', label: 'AI Interview', icon: '🤖',
+        statuses: ['ai_interview_sent', 'ai_interview_accepted',
+                   'ai_interview_in_progress', 'ai_interview_complete']
+      });
+    }
+    if (job?.coding_round_enabled) {
+      stages.push({
+        key: 'coding', label: 'Coding Assessment', icon: '💻',
+        statuses: ['coding_sent', 'coding_complete']
+      });
+    }
+    const humanRounds = job?.human_rounds || [];
+    humanRounds.forEach((r, i) => {
+      stages.push({
+        key: `human_round_${i + 1}`,
+        label: r.round_name || `Round ${i + 1}`,
+        icon: '👤',
+        statuses: [
+          i === 0 ? 'waiting_technical_interview' : `waiting_round_${i + 1}`,
+          i === 0 ? 'technical_complete' : `round_${i + 1}_complete`
+        ]
+      });
+    });
+    if (humanRounds.length === 0) {
+      stages.push({
+        key: 'technical', label: 'Technical Interview', icon: '👤',
+        statuses: ['waiting_technical_interview']
+      });
+      stages.push({
+        key: 'hr', label: 'HR Interview', icon: '👤',
+        statuses: ['waiting_hr_interview']
+      });
+    }
+  } else {
+    // Standard: AI Interview → Technical → HR
+    if (job?.ai_interview_enabled !== false) {
+      stages.push({
+        key: 'ai_interview', label: 'AI Interview', icon: '🤖',
+        statuses: ['ai_interview_sent', 'ai_interview_accepted',
+                   'ai_interview_in_progress', 'ai_interview_complete']
+      });
+    }
+    if (job?.coding_round_enabled) {
+      stages.push({
+        key: 'coding', label: 'Coding Assessment', icon: '💻',
+        statuses: ['coding_sent', 'coding_complete']
+      });
+    }
+    stages.push({
+      key: 'technical', label: 'Technical Interview', icon: '👤',
+      statuses: ['waiting_technical_interview']
+    });
+    stages.push({
+      key: 'hr', label: 'HR Interview', icon: '👤',
+      statuses: ['waiting_hr_interview']
+    });
+  }
+
+  // Final stage — Always: Decision
+  stages.push({
+    key: 'decision', label: 'Final Decision', icon: '🎯',
+    statuses: ['evaluating', 'hired', 'rejected']
+  });
+
+  return stages;
 }
 
-export default function TrackPage() {
-  const [query, setQuery]       = useState('');
-  const [loading, setLoading]   = useState(false);
-  const [candidate, setCandidate] = useState(null);
-  const [notFound, setNotFound] = useState(false);
+// ── Find which stage the candidate is at ─────────────────────────
+function getCurrentStageIndex(stages, status) {
+  if (!status) return 0;
 
-  const track = async () => {
-    if (!query.trim()) return;
-    setLoading(true);
+  // Special: rejected or hired → last stage
+  if (status === 'hired' || status === 'rejected') {
+    return stages.length - 1;
+  }
+
+  for (let i = stages.length - 1; i >= 0; i--) {
+    if (stages[i].statuses.includes(status)) return i;
+  }
+
+  // Fallback: check partial matches
+  for (let i = stages.length - 1; i >= 0; i--) {
+    if (stages[i].statuses.some(s =>
+      status.includes(s) || s.includes(status))) return i;
+  }
+
+  return 0;
+}
+
+// ── Status message per stage ─────────────────────────────────────
+function getStatusMessage(status) {
+  const messages = {
+    'applied':                    'Your application is being processed',
+    'screened':                   'Resume reviewed — preparing next step',
+    'ai_interview_sent':          'AI interview link sent to your email — complete within 3 days',
+    'ai_interview_accepted':      'Interview link ready — take it at your convenience',
+    'ai_interview_in_progress':   'AI interview in progress',
+    'ai_interview_complete':      'AI interview complete — being evaluated',
+    'coding_sent':                'Coding assessment sent to your email',
+    'coding_complete':            'Coding assessment complete',
+    'waiting_technical_interview': 'Technical interview scheduled',
+    'waiting_hr_interview':       'Technical passed — HR round next',
+    'evaluating':                 'Final evaluation in progress',
+    'hired':                      'Congratulations! Offer sent to your email',
+    'rejected':                   'This role wasn\'t a match this time',
+  };
+  return messages[status] || 'Processing...';
+}
+
+// ── Rejection stage label ────────────────────────────────────────
+function getRejectionStage(status, stages, stageIdx) {
+  if (status !== 'rejected') return null;
+  if (stageIdx > 0 && stageIdx < stages.length - 1) {
+    return stages[stageIdx - 1]?.label || 'Evaluation';
+  }
+  return 'Screening';
+}
+
+export default function TrackPage({ initialQuery = '' }) {
+  const [query, setQuery]           = useState(initialQuery);
+  const [loading, setLoading]       = useState(false);
+  const [candidate, setCandidate]   = useState(null);
+  const [job, setJob]               = useState(null);
+  const [notFound, setNotFound]     = useState(false);
+  const [lastUpdate, setLastUpdate] = useState(null);
+  const refreshRef    = useRef(null);
+  const hasAutoSearched = useRef(false);
+
+  useEffect(() => {
+    if (initialQuery && !hasAutoSearched.current) {
+      hasAutoSearched.current = true;
+      setQuery(initialQuery);
+      doTrack(initialQuery);
+    }
+  }, [initialQuery]);
+
+  useEffect(() => {
+    if (candidate && candidate.id) {
+      refreshRef.current = setInterval(() => {
+        doTrack(candidate.id, true);
+      }, 8000);
+    }
+    return () => {
+      if (refreshRef.current) clearInterval(refreshRef.current);
+    };
+  }, [candidate?.id]);
+
+  const doTrack = async (searchQuery, silent = false) => {
+    const q = (searchQuery || query).trim();
+    if (!q) return;
+    if (!silent) setLoading(true);
     setNotFound(false);
-    setCandidate(null);
 
     try {
-      // Try by ID first
       let result = null;
+
       try {
-        const r = await axios.get(`${API_URL}/api/candidates/${query.trim()}`);
+        const r = await axios.get(`${API_URL}/api/candidates/${q}`);
         result = r.data;
       } catch {
-        // Try by email — fetch all and match
-        const all = await axios.get(`${API_URL}/api/candidates`);
-        result = (all.data || []).find(c =>
-          c.email?.toLowerCase() === query.trim().toLowerCase() ||
-          c.id?.startsWith(query.trim().toLowerCase()));
+        try {
+          const all = await axios.get(`${API_URL}/api/candidates`);
+          result = (all.data || []).find(c =>
+            c.email?.toLowerCase() === q.toLowerCase() ||
+            c.id?.startsWith(q.toLowerCase()) ||
+            c.id === q);
+        } catch {}
       }
 
       if (result) {
         setCandidate(result);
-      } else {
-        // Demo fallback
-        setCandidate({
-          name: 'Demo Candidate',
-          applied_role: 'Senior AI Engineer',
-          status: 'ai_interview_complete',
-          resume_score: 88,
-          ai_interview_score: 82,
-          created_at: new Date().toISOString(),
-          id: query.trim()
-        });
+        setLastUpdate(new Date().toLocaleTimeString());
+
+        // Fetch job config for pipeline stages
+        if (result.job_id) {
+          try {
+            const jr = await axios.get(`${API_URL}/api/jobs/${result.job_id}`);
+            setJob(jr.data);
+          } catch {
+            setJob(null);
+          }
+        }
+      } else if (!silent) {
+        setNotFound(true);
+        setCandidate(null);
       }
     } catch {
-      setNotFound(true);
+      if (!silent) setNotFound(true);
     }
-    setLoading(false);
+    if (!silent) setLoading(false);
   };
 
-  const stageIdx = candidate ? getStageIndex(candidate.status) : 0;
-  const isRejected = candidate?.status === 'rejected';
-  const isHired = candidate?.status === 'hired';
+  const handleTrack = () => doTrack(query);
+  const handleKeyDown = (e) => { if (e.key === 'Enter') handleTrack(); };
+
+  const stages      = candidate ? buildStages(candidate, job) : [];
+  const stageIdx    = candidate ? getCurrentStageIndex(stages, candidate.status) : 0;
+  const isRejected  = candidate?.status === 'rejected';
+  const isHired     = candidate?.status === 'hired';
+  const isComplete  = isRejected || isHired;
+
+  // Only show stages up to current + 1 (or all completed + next)
+  const visibleStages = stages.filter((_, i) => {
+    if (isComplete) {
+      // Show all stages up to and including the final one
+      return i <= stageIdx;
+    }
+    // Show completed + current + next one
+    return i <= stageIdx + 1;
+  });
 
   return (
     <div style={{ maxWidth: '600px', margin: '0 auto', padding: '50px 24px 100px' }}>
@@ -91,11 +286,12 @@ export default function TrackPage() {
 
       <GlassCard hover={false} style={{ marginBottom: '28px' }}>
         <div style={{ display: 'flex', gap: '10px' }}>
-          <GlassInput value={query}
-            onChange={e => setQuery(e.target.value)}
-            placeholder="Tracking ID or email"
-            style={{ flex: 1 }} />
-          <AuroraButton onClick={track} disabled={loading}>
+          <div style={{ flex: 1 }} onKeyDown={handleKeyDown}>
+            <GlassInput value={query}
+              onChange={e => setQuery(e.target.value)}
+              placeholder="Tracking ID or email" />
+          </div>
+          <AuroraButton onClick={handleTrack} disabled={loading}>
             {loading ? '...' : 'Track'}
           </AuroraButton>
         </div>
@@ -103,7 +299,7 @@ export default function TrackPage() {
 
       {notFound && (
         <GlassCard hover={false} style={{ textAlign: 'center' }}>
-          <p style={{ color: theme.textSecondary }}>
+          <p style={{ color: theme.textSecondary, margin: 0 }}>
             No application found. Check your tracking ID or email.
           </p>
         </GlassCard>
@@ -114,104 +310,191 @@ export default function TrackPage() {
           initial={{ opacity: 0, y: 20 }} animate={{ opacity: 1, y: 0 }}
           transition={{ duration: 0.5 }}>
           <GlassCard hover={false} glow>
+
             {/* Header */}
-            <div style={{ marginBottom: '24px', paddingBottom: '16px',
+            <div style={{ display: 'flex', justifyContent: 'space-between',
+              alignItems: 'flex-start', marginBottom: '20px', paddingBottom: '16px',
               borderBottom: `1px solid ${theme.glassBorder}` }}>
-              <div style={{ ...fonts.h2, color: theme.textPrimary }}>
-                {candidate.applied_role}
+              <div>
+                <div style={{ ...fonts.h2, color: theme.textPrimary }}>
+                  {candidate.applied_role}
+                </div>
+                <div style={{ fontSize: '13px', color: theme.textTertiary, marginTop: '4px' }}>
+                  {candidate.name} · ID: {(candidate.id || '').slice(0, 8).toUpperCase()}
+                </div>
+                {job && (
+                  <div style={{ fontSize: '12px', color: theme.textMuted, marginTop: '4px' }}>
+                    Pipeline: {(job.interview_mode || 'standard').charAt(0).toUpperCase() +
+                      (job.interview_mode || 'standard').slice(1)}
+                  </div>
+                )}
               </div>
-              <div style={{ fontSize: '13px', color: theme.textTertiary, marginTop: '4px' }}>
-                {candidate.name} · ID: {(candidate.id || '').slice(0, 8).toUpperCase()}
-              </div>
+              {!isComplete && (
+                <div style={{ display: 'flex', alignItems: 'center', gap: '6px' }}>
+                  <motion.div
+                    animate={{ opacity: [0.4, 1, 0.4] }}
+                    transition={{ duration: 1.5, repeat: Infinity }}
+                    style={{ width: '8px', height: '8px', borderRadius: '50%',
+                      background: theme.cyan }} />
+                  <span style={{ fontSize: '11px', color: theme.textTertiary }}>Live</span>
+                </div>
+              )}
             </div>
 
-            {/* Status banner */}
+            {/* Scores (only show what exists) */}
+            {(candidate.resume_score || candidate.ai_interview_score) && (
+              <div style={{ display: 'flex', gap: '10px', marginBottom: '20px' }}>
+                {candidate.resume_score && (
+                  <ScoreCard label="Resume" value={candidate.resume_score} />
+                )}
+                {candidate.ai_interview_score && (
+                  <ScoreCard label="AI Interview" value={candidate.ai_interview_score} />
+                )}
+                {candidate.final_score && (
+                  <ScoreCard label="Final" value={candidate.final_score} />
+                )}
+              </div>
+            )}
+
+            {/* Hired banner */}
             {isHired && (
-              <div style={{ background: 'rgba(52,211,153,0.1)',
-                border: '1px solid rgba(52,211,153,0.3)', borderRadius: '12px',
-                padding: '14px', marginBottom: '20px', textAlign: 'center' }}>
-                <span style={{ color: theme.success, fontWeight: 700 }}>
-                  🎉 Congratulations! You've been selected.
-                </span>
-              </div>
-            )}
-            {isRejected && (
-              <div style={{ background: 'rgba(124,108,246,0.08)',
-                border: `1px solid ${theme.glassBorder}`, borderRadius: '12px',
-                padding: '14px', marginBottom: '20px', textAlign: 'center' }}>
-                <span style={{ color: theme.textSecondary }}>
-                  This role wasn't a match, but a growth report was sent to your email.
-                </span>
-              </div>
-            )}
-
-            {/* Vertical Timeline */}
-            <div style={{ position: 'relative', paddingLeft: '36px' }}>
-              {/* connecting line */}
-              <div style={{ position: 'absolute', left: '15px', top: '12px',
-                bottom: '12px', width: '2px', background: 'rgba(255,255,255,0.08)' }} />
               <motion.div
-                initial={{ height: 0 }}
-                animate={{ height: `${(stageIdx / (STAGES.length - 1)) * 100}%` }}
-                transition={{ duration: 1, ease: 'easeOut' }}
-                style={{ position: 'absolute', left: '15px', top: '12px',
-                  width: '2px', background: theme.gradient,
-                  boxShadow: '0 0 8px rgba(124,108,246,0.5)' }} />
+                initial={{ opacity: 0, scale: 0.95 }}
+                animate={{ opacity: 1, scale: 1 }}
+                style={{ background: 'rgba(52,211,153,0.1)',
+                  border: '1px solid rgba(52,211,153,0.3)', borderRadius: '12px',
+                  padding: '16px', marginBottom: '20px', textAlign: 'center' }}>
+                <div style={{ fontSize: '24px', marginBottom: '4px' }}>🎉</div>
+                <span style={{ color: theme.success, fontWeight: 700, fontSize: '15px' }}>
+                  Congratulations! You've been selected.
+                </span>
+                <div style={{ fontSize: '13px', color: theme.textSecondary, marginTop: '6px' }}>
+                  Check your email for the offer letter.
+                </div>
+              </motion.div>
+            )}
 
-              {STAGES.map((stage, i) => {
-                const done = i < stageIdx || (i === stageIdx && (isHired || isRejected));
-                const current = i === stageIdx && !isHired && !isRejected;
-                const upcoming = i > stageIdx;
+            {/* Rejected banner */}
+            {isRejected && (
+              <motion.div
+                initial={{ opacity: 0, scale: 0.95 }}
+                animate={{ opacity: 1, scale: 1 }}
+                style={{ background: 'rgba(255,255,255,0.03)',
+                  border: `1px solid ${theme.glassBorder}`, borderRadius: '12px',
+                  padding: '16px', marginBottom: '20px', textAlign: 'center' }}>
+                <span style={{ color: theme.textSecondary, fontSize: '14px' }}>
+                  This role wasn't the right fit this time.
+                  A personalized growth report has been sent to your email
+                  to help you improve.
+                </span>
+              </motion.div>
+            )}
+
+            {/* Dynamic Timeline */}
+            <div style={{ position: 'relative', paddingLeft: '36px' }}>
+              {/* Background line */}
+              {visibleStages.length > 1 && (
+                <div style={{ position: 'absolute', left: '15px', top: '12px',
+                  bottom: '12px', width: '2px', background: 'rgba(255,255,255,0.06)' }} />
+              )}
+
+              {/* Progress line */}
+              {visibleStages.length > 1 && (
+                <motion.div
+                  initial={{ height: 0 }}
+                  animate={{
+                    height: `${(Math.min(stageIdx, visibleStages.length - 1) /
+                      Math.max(visibleStages.length - 1, 1)) * 100}%`
+                  }}
+                  transition={{ duration: 1, ease: 'easeOut' }}
+                  style={{ position: 'absolute', left: '15px', top: '12px',
+                    width: '2px',
+                    background: isRejected
+                      ? 'linear-gradient(180deg, #34d399, #fb7185)'
+                      : theme.gradient,
+                    boxShadow: `0 0 8px ${isRejected ? 'rgba(251,113,133,0.4)' : 'rgba(124,108,246,0.5)'}` }} />
+              )}
+
+              {visibleStages.map((stage, i) => {
+                const realIdx = stages.indexOf(stage);
+                const done    = realIdx < stageIdx;
+                const current = realIdx === stageIdx;
+                const next    = realIdx > stageIdx;
+                const isRejectedHere = isRejected && current;
 
                 return (
                   <motion.div key={stage.key}
                     initial={{ opacity: 0, x: -10 }}
                     animate={{ opacity: 1, x: 0 }}
-                    transition={{ delay: i * 0.15 }}
+                    transition={{ delay: i * 0.12 }}
                     style={{ position: 'relative', marginBottom: '24px',
                       minHeight: '24px' }}>
-                    {/* dot */}
+
+                    {/* Dot */}
                     <div style={{ position: 'absolute', left: '-36px', top: '0',
                       width: '32px', height: '32px', borderRadius: '50%',
                       display: 'flex', alignItems: 'center', justifyContent: 'center',
                       fontSize: '14px',
                       background: done ? 'rgba(52,211,153,0.15)'
-                        : current ? 'rgba(124,108,246,0.2)' : 'rgba(255,255,255,0.04)',
+                        : isRejectedHere ? 'rgba(251,113,133,0.15)'
+                        : current ? 'rgba(124,108,246,0.2)'
+                        : 'rgba(255,255,255,0.04)',
                       border: `2px solid ${done ? theme.success
-                        : current ? theme.primary : theme.glassBorder}`,
-                      boxShadow: current ? '0 0 16px rgba(124,108,246,0.5)' : 'none' }}>
-                      {done ? '✓' : stage.icon}
-                      {current && (
+                        : isRejectedHere ? theme.danger
+                        : current ? theme.primary
+                        : theme.glassBorder}`,
+                      boxShadow: current && !isRejectedHere
+                        ? '0 0 16px rgba(124,108,246,0.5)' : 'none' }}>
+                      {done ? '✓' : isRejectedHere ? '✗' : stage.icon}
+
+                      {/* Pulsing ring on current (non-rejected) */}
+                      {current && !isComplete && (
                         <motion.div
                           animate={{ scale: [1, 1.6], opacity: [0.6, 0] }}
                           transition={{ duration: 1.5, repeat: Infinity }}
                           style={{ position: 'absolute', inset: '-2px',
-                            borderRadius: '50%', border: `2px solid ${theme.primary}` }} />
+                            borderRadius: '50%',
+                            border: `2px solid ${theme.primary}` }} />
                       )}
                     </div>
 
+                    {/* Label */}
                     <div style={{ ...fonts.h3, fontSize: '15px',
-                      color: upcoming ? theme.textTertiary : theme.textPrimary }}>
-                      {stage.label}
+                      color: next ? theme.textTertiary
+                        : isRejectedHere ? theme.danger
+                        : theme.textPrimary }}>
+                      {isRejectedHere ? `Rejected at ${stage.label}` : stage.label}
                     </div>
+
+                    {/* Sub-text */}
                     {done && stage.key === 'screened' && candidate.resume_score && (
                       <div style={{ fontSize: '13px', color: theme.success }}>
-                        Score: {candidate.resume_score}/100 — Strong match
+                        Score: {candidate.resume_score}/100
                       </div>
                     )}
-                    {done && stage.key === 'ai' && candidate.ai_interview_score && (
+                    {done && stage.key === 'ai_interview' && candidate.ai_interview_score && (
                       <div style={{ fontSize: '13px', color: theme.success }}>
                         Score: {candidate.ai_interview_score}/100
                       </div>
                     )}
-                    {current && (
+                    {current && !isComplete && (
                       <div style={{ fontSize: '13px', color: theme.primary }}>
-                        In progress now
+                        {getStatusMessage(candidate.status)}
                       </div>
                     )}
-                    {upcoming && (
+                    {isRejectedHere && (
+                      <div style={{ fontSize: '13px', color: theme.textSecondary, marginTop: '4px' }}>
+                        A growth report was sent to your email
+                      </div>
+                    )}
+                    {isHired && current && (
+                      <div style={{ fontSize: '13px', color: theme.success }}>
+                        Offer sent — check your email
+                      </div>
+                    )}
+                    {next && (
                       <div style={{ fontSize: '13px', color: theme.textMuted }}>
-                        Upcoming
+                        Coming up next
                       </div>
                     )}
                   </motion.div>
@@ -219,20 +502,50 @@ export default function TrackPage() {
               })}
             </div>
 
-            {/* Next step */}
-            {!isHired && !isRejected && (
+            {/* Current status box */}
+            {!isComplete && (
               <div style={{ marginTop: '8px', padding: '14px',
                 background: 'rgba(124,108,246,0.06)', borderRadius: '12px',
                 border: `1px solid ${theme.glassBorder}` }}>
-                <div style={{ ...fonts.caption, color: theme.textTertiary }}>Next Step</div>
-                <div style={{ fontSize: '14px', color: theme.textPrimary, marginTop: '4px' }}>
-                  You'll receive an update within 24 hours.
+                <div style={{ fontSize: '11px', color: theme.textTertiary,
+                  textTransform: 'uppercase', letterSpacing: '0.5px',
+                  marginBottom: '4px' }}>
+                  Current Status
+                </div>
+                <div style={{ fontSize: '14px', color: theme.textPrimary }}>
+                  {getStatusMessage(candidate.status)}
                 </div>
               </div>
             )}
+
+            {/* Last updated */}
+            {lastUpdate && (
+              <div style={{ marginTop: '12px', fontSize: '11px',
+                color: theme.textMuted, textAlign: 'center' }}>
+                Auto-refreshing · Last updated: {lastUpdate}
+              </div>
+            )}
+
           </GlassCard>
         </motion.div>
       )}
+    </div>
+  );
+}
+
+// ── Score Card ────────────────────────────────────────────────────
+function ScoreCard({ label, value }) {
+  return (
+    <div style={{ flex: 1, background: 'rgba(255,255,255,0.03)',
+      border: `1px solid ${theme.glassBorder}`, borderRadius: '12px',
+      padding: '12px', textAlign: 'center' }}>
+      <div style={{ fontSize: '22px', fontWeight: 800,
+        color: theme.textPrimary }}>
+        {value}
+      </div>
+      <div style={{ fontSize: '11px', color: theme.textTertiary }}>
+        {label}
+      </div>
     </div>
   );
 }

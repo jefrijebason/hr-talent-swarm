@@ -7,17 +7,14 @@ from shared.service_bus import publish_human_gate
 from shared.config import config
 from agents.screener.agent import run_screener
 from agents.evaluator.agent import run_evaluator
-from agents.communicator.agent import run_communicator
-from agents.interviewer.agent import run_ai_interview
+from agents.communicator.agent import run_communicator, send_email
 from agents.interviewer.growth_report import generate_growth_report
 import uuid
 
-# ── Thresholds ──────────────────────────────────────────────────
 SCREENING_THRESHOLD = 60
 HUMAN_THRESHOLD     = 70
 HIRE_THRESHOLD      = 65
 
-# ── Default JD ──────────────────────────────────────────────────
 DEFAULT_JD = """
 Senior AI Engineer
 
@@ -38,41 +35,30 @@ Salary: 18-24 LPA
 Location: Bangalore (Hybrid)
 """
 
-def create_candidate(name: str, email: str,
-                     phone: str, applied_role: str,
-                     expected_ctc: str) -> str:
-    """Create a new candidate record in Cosmos DB."""
+
+def create_candidate(name, email, phone, applied_role, expected_ctc):
     candidate_id = str(uuid.uuid4())
     candidate = {
-        "id":           candidate_id,
-        "name":         name,
-        "email":        email,
-        "phone":        phone,
-        "applied_role": applied_role,
-        "expected_ctc": expected_ctc,
-        "status":       "applied"
+        "id": candidate_id, "name": name, "email": email,
+        "phone": phone, "applied_role": applied_role,
+        "expected_ctc": expected_ctc, "status": "applied"
     }
     save_candidate(candidate)
     print(f"[ORCH] Candidate created: {candidate_id}")
     return candidate_id
 
-def run_ai_pipeline(candidate_id: str,
-                    pdf_bytes: bytes,
-                    job_role: str,
-                    jd_text: str = DEFAULT_JD) -> dict:
+
+def run_ai_pipeline(candidate_id, pdf_bytes, job_role, jd_text=DEFAULT_JD):
     """
-    Stage 1 + 2: Screening + AI Interview
-    Runs entirely with AI.
-    If strong enough → routes to Human Technical Interview
-    using the Interviewer Pool with smart matching.
+    Stage 1: Resume Screening
+    Stage 2: Send AI Interview link → PIPELINE PAUSES
+    Pipeline resumes only when candidate completes the real interview.
     """
     print(f"\n[ORCH] ═══ AI PIPELINE START: {candidate_id} ═══")
 
     # ── STAGE 1: Resume Screening ────────────────────────────────
     print(f"[ORCH] Stage 1: Resume Screening")
-    screen_result = run_screener(
-        candidate_id, pdf_bytes, job_role
-    )
+    screen_result = run_screener(candidate_id, pdf_bytes, job_role)
 
     if "error" in screen_result:
         print(f"[ORCH] Screener failed")
@@ -81,88 +67,75 @@ def run_ai_pipeline(candidate_id: str,
     resume_score = screen_result.get("overall_score", 0)
     print(f"[ORCH] Resume score: {resume_score}/100")
 
-    # Below threshold → auto reject
     if resume_score < SCREENING_THRESHOLD:
         print(f"[ORCH] Score too low → Rejection")
         _send_rejection_with_growth(candidate_id)
-        return {
-            "status":       "rejected",
-            "reason":       "low_resume_score",
-            "resume_score": resume_score
-        }
+        return {"status": "rejected", "reason": "low_resume_score",
+                "resume_score": resume_score}
 
- 
-# ── STAGE 2: Send AI Interview Link ──────────────────────────
+    # ── STAGE 2: Send AI Interview Link ──────────────────────────
     print(f"[ORCH] Stage 2: Sending AI Interview Link")
 
-    # Send interview link to candidate email
-    try:
-        import requests
-        requests.post("http://localhost:8000/api/send-interview-link",
-            data={"candidate_id": candidate_id})
-        print(f"[ORCH] AI Interview link sent to candidate")
-    except Exception as e:
-        print(f"[ORCH] Could not send interview link: {e}")
+    _send_interview_link(candidate_id)
 
-    # Still run AI interview in background for scoring
-    candidate   = get_candidate(candidate_id)
-    resume_text = _get_resume_text(pdf_bytes)
+    update_candidate(candidate_id, {
+        "status":      "ai_interview_sent",
+        "resume_text": _get_resume_text(pdf_bytes),
+        "jd_text_used": jd_text
+    })
 
-    interview_result = run_ai_interview(
-        candidate_id, resume_text, jd_text
-    )
+    write_audit(candidate_id, "ORCHESTRATOR",
+                "ai_interview_sent", {"resume_score": resume_score})
 
-    ai_score = interview_result.get("score", 0)
-    print(f"[ORCH] AI Interview score: {ai_score}/100")
+    print(f"[ORCH] Pipeline paused — waiting for candidate to complete AI interview")
+    print(f"[ORCH] ═══ AI PIPELINE PAUSED ═══\n")
+    return {
+        "status":       "ai_interview_sent",
+        "resume_score": resume_score,
+        "message":      "Waiting for candidate to complete AI interview"
+    }
 
-    combined_ai = (resume_score * 0.4) + (ai_score * 0.6)
-    print(f"[ORCH] Combined AI score: {combined_ai:.1f}/100")
 
-    candidate   = get_candidate(candidate_id)
-    resume_text = _get_resume_text(pdf_bytes)
+def resume_pipeline_after_interview(candidate_id, ai_score):
+    """
+    Called after candidate completes the REAL AI interview via ARIA.
+    Resumes the pipeline: evaluate → assign technical interviewer.
+    """
+    print(f"\n[ORCH] ═══ PIPELINE RESUMING: {candidate_id} ═══")
+    print(f"[ORCH] Real AI Interview score: {ai_score}/100")
 
-    interview_result = run_ai_interview(
-        candidate_id, resume_text, jd_text
-    )
-
-    ai_score = interview_result.get("score", 0)
-    print(f"[ORCH] AI Interview score: {ai_score}/100")
+    candidate    = get_candidate(candidate_id)
+    resume_score = candidate.get("resume_score", 0)
 
     combined_ai = (resume_score * 0.4) + (ai_score * 0.6)
     print(f"[ORCH] Combined AI score: {combined_ai:.1f}/100")
 
-    # Below threshold → auto reject
     if combined_ai < SCREENING_THRESHOLD:
         print(f"[ORCH] Combined score too low → Rejection")
+        update_candidate(candidate_id, {"status": "rejected"})
         _send_rejection_with_growth(candidate_id)
-        return {
-            "status":       "rejected",
-            "reason":       "low_ai_scores",
-            "resume_score": resume_score,
-            "ai_score":     ai_score
-        }
+        return {"status": "rejected", "reason": "low_ai_scores",
+                "combined": combined_ai}
 
-    # ── STAGE 3: Route to Human Technical Interview ──────────────
+    # Strong candidate → Route to Human Technical Interview
     print(f"[ORCH] Strong candidate → Technical Interview")
 
-    profile  = interview_result.get("profile", {})
+    profile  = candidate.get("ai_profile", {})
     briefing = profile.get("human_interview_briefing", {})
 
-    # Get job info to find HR who posted the JD
-    candidate   = get_candidate(candidate_id)
-    job_id      = candidate.get("job_id", "")
-    hr_id       = ""
-    hr_email    = ""
-    hr_name     = ""
+    job_id  = candidate.get("job_id", "")
+    hr_id   = ""
+    hr_name = ""
 
     if job_id:
         try:
             from shared.cosmos_client import get_job
-            job      = get_job(job_id)
-            hr_id    = job.get("posted_by_hr_id", "") if job else ""
-            hr_email = job.get("posted_by_hr_email", "") if job else ""
-            hr_name  = job.get("posted_by_hr_name", "") if job else ""
-            print(f"[ORCH] Job posted by HR: {hr_name} ({hr_email})")
+            job = get_job(job_id)
+            if job:
+                hr_id   = job.get("posted_by_hr_id", "")
+                hr_name = job.get("posted_by_hr_name", "")
+                if hr_name:
+                    print(f"[ORCH] Job posted by HR: {hr_name}")
         except Exception as e:
             print(f"[ORCH] Could not get job HR: {e}")
 
@@ -177,432 +150,242 @@ def run_ai_pipeline(candidate_id: str,
                 "routed_to_technical_interview", {
         "resume_score": resume_score,
         "ai_score":     ai_score,
-        "combined":     combined_ai,
-        "hr_id":        hr_id
+        "combined":     combined_ai
     })
 
-    # ── Use Interviewer Pool for Smart Assignment ────────────────
     assign_result = _assign_interviewer(
         candidate_id, job_id, hr_id, "technical"
     )
-    print(f"[ORCH] Assignment result: {assign_result}")
+    print(f"[ORCH] Assignment: {assign_result}")
 
-    print(f"[ORCH] ═══ AI PIPELINE COMPLETE ═══\n")
+    # Notify HR who posted the JD
+    _notify_hr_of_progress(candidate_id, "ai_interview_passed",
+        f"AI Interview passed. Score: {ai_score}/100. Technical interview being scheduled.")
+
+    print(f"[ORCH] ═══ PIPELINE RESUMED — TECHNICAL ASSIGNED ═══\n")
     return {
-        "status":          "needs_technical_interview",
-        "resume_score":    resume_score,
-        "ai_score":        ai_score,
-        "combined":        combined_ai,
-        "briefing":        briefing,
-        "assignment":      assign_result
+        "status":     "needs_technical_interview",
+        "combined":   combined_ai,
+        "assignment": assign_result
     }
 
-def _assign_interviewer(candidate_id: str,
-                         job_id: str,
-                         hr_id: str,
-                         interview_type: str) -> dict:
-    """
-    Assign best matched interviewer using pool.
-    Falls back to service bus if pool unavailable.
-    """
+
+def _assign_interviewer(candidate_id, job_id, hr_id, interview_type):
     try:
-        from agents.interviewer_pool.agent import (
-            assign_interviewer_to_candidate
-        )
+        from agents.interviewer_pool.agent import assign_interviewer_to_candidate
         result = assign_interviewer_to_candidate(
             candidate_id, job_id, hr_id, interview_type
         )
-        print(f"[ORCH] Interviewer pool assignment: {result.get('status')}")
+        print(f"[ORCH] Interviewer pool: {result.get('status')}")
         return result
-
     except Exception as e:
-        print(f"[ORCH] Pool assignment error: {e} — falling back to service bus")
+        print(f"[ORCH] Pool error: {e} — falling back to service bus")
         try:
             candidate = get_candidate(candidate_id)
             briefing  = candidate.get("human_briefing", {})
-            publish_human_gate(
-                "needs-scheduling",
-                candidate_id,
-                {
-                    "interview_type": interview_type,
-                    "briefing":       briefing
-                }
-            )
-            # Auto schedule as fallback
+            publish_human_gate("needs-scheduling", candidate_id,
+                {"interview_type": interview_type, "briefing": briefing})
             from agents.scheduler.agent import run_scheduler
             run_scheduler(candidate_id, interview_type)
         except Exception as e2:
             print(f"[ORCH] Fallback also failed: {e2}")
-
         return {"status": "fallback_used"}
 
-def technical_interview_result(candidate_id: str,
-                                tech_score: float,
-                                system_design_score: float,
-                                notes: str,
-                                passed: bool) -> dict:
+
+def technical_interview_result(candidate_id, tech_score,
+                                system_design_score, notes, passed):
     """
-    Gate 1: Technical Lead submits scores.
-    PASS → Schedule HR Round using interviewer pool
-    FAIL → Send rejection email
-    Notifies the HR who posted the JD.
+    Gate 1: Technical interviewer submits scores.
+    PASS → Schedule HR Round
+    FAIL → Rejection email + notify HR
     """
     print(f"\n[ORCH] ═══ TECHNICAL GATE: {candidate_id} ═══")
-    print(f"[ORCH] Tech: {tech_score}/10 | Design: {system_design_score}/10 | Passed: {passed}")
+    print(f"[ORCH] Tech: {tech_score}/10 | Passed: {passed}")
 
     update_candidate(candidate_id, {
-        "human_tech_score":          tech_score,
+        "human_tech_score": tech_score,
         "human_system_design_score": system_design_score,
-        "technical_notes":           notes,
-        "technical_passed":          passed,
+        "technical_notes": notes,
+        "technical_passed": passed,
         "status": "waiting_hr_interview" if passed else "rejected"
     })
 
-    write_audit(candidate_id, "ORCHESTRATOR",
-                "technical_gate_decision", {
-        "tech_score":          tech_score,
-        "system_design_score": system_design_score,
-        "passed":              passed,
-        "notes":               notes
+    write_audit(candidate_id, "ORCHESTRATOR", "technical_gate_decision", {
+        "tech_score": tech_score, "passed": passed, "notes": notes
     })
 
     if not passed:
-        print(f"[ORCH] Technical FAILED → Rejection email")
+        print(f"[ORCH] Technical FAILED → Rejection")
         _send_rejection_with_growth(candidate_id)
-
-        # Notify HR who posted the JD
         _notify_hr_of_rejection(candidate_id, "technical_interview")
+        return {"status": "rejected", "reason": "failed_technical"}
 
-        return {
-            "status": "rejected",
-            "reason": "failed_technical_interview"
-        }
-
-    # Passed → Build HR briefing
     print(f"[ORCH] Technical PASSED → HR Round")
     candidate = get_candidate(candidate_id)
     profile   = candidate.get("ai_profile", {})
     market    = profile.get("market_intelligence", {})
 
     hr_briefing = {
-        "focus_on": [
-            "Why this company specifically",
-            "Career motivation and goals",
-            "Salary negotiation",
-            "Leadership style",
-            "Cultural fit"
-        ],
+        "focus_on": ["Why this company", "Career goals",
+                     "Salary", "Leadership", "Culture fit"],
         "market_rate":        market.get("market_rate"),
         "candidate_expected": candidate.get("expected_ctc"),
-        "suggested_offer":    market.get("recommendation"),
-        "retention_risk":     market.get("retention_risk"),
         "ai_score":           candidate.get("ai_interview_score"),
         "technical_score":    tech_score
     }
 
     update_candidate(candidate_id, {
-        "hr_briefing": hr_briefing,
-        "status":      "waiting_hr_interview"
+        "hr_briefing": hr_briefing, "status": "waiting_hr_interview"
     })
 
-    # Get job and HR info
     job_id = candidate.get("job_id", "")
     hr_id  = candidate.get("hr_id", "")
 
-    # Assign HR round interviewer using pool
     assign_result = _assign_interviewer(
         candidate_id, job_id, hr_id, "hr_round"
     )
 
-    # Notify HR who posted the JD
-    _notify_hr_of_progress(
-        candidate_id,
-        "technical_interview_passed",
-        f"Technical interview passed. Score: {tech_score}/10. HR round scheduled."
-    )
+    _notify_hr_of_progress(candidate_id, "technical_passed",
+        f"Technical passed. Score: {tech_score}/10. HR round scheduled.")
 
     print(f"[ORCH] ═══ TECHNICAL GATE COMPLETE ═══\n")
-    return {
-        "status":      "needs_hr_interview",
-        "hr_briefing": hr_briefing,
-        "assignment":  assign_result
-    }
+    return {"status": "needs_hr_interview", "hr_briefing": hr_briefing}
 
-def hr_interview_result(candidate_id: str,
-                         culture_score: float,
-                         communication_score: float,
-                         agreed_salary: str,
-                         notes: str,
-                         hired: bool) -> dict:
+
+def hr_interview_result(candidate_id, culture_score,
+                         communication_score, agreed_salary,
+                         notes, hired):
     """
-    Gate 2: HR Manager submits scores after HR Round.
-    HIRE → Offer letter sent
-    REJECT → Rejection with feedback
-    Notifies the HR who posted the JD either way.
+    Gate 2: HR submits scores.
+    HIRE → Offer letter sent + notify HR
+    REJECT → Rejection + growth report + notify HR
     """
     print(f"\n[ORCH] ═══ HR GATE: {candidate_id} ═══")
     print(f"[ORCH] Culture: {culture_score}/10 | Hired: {hired}")
 
     update_candidate(candidate_id, {
-        "human_culture_score":       culture_score,
+        "human_culture_score": culture_score,
         "human_communication_score": communication_score,
-        "agreed_salary":             agreed_salary,
-        "hr_notes":                  notes,
-        "status":                    "evaluating"
+        "agreed_salary": agreed_salary,
+        "hr_notes": notes, "status": "evaluating"
     })
 
-    write_audit(candidate_id, "ORCHESTRATOR",
-                "hr_gate_decision", {
-        "culture_score":       culture_score,
-        "communication_score": communication_score,
-        "agreed_salary":       agreed_salary,
-        "hired":               hired,
-        "notes":               notes
+    write_audit(candidate_id, "ORCHESTRATOR", "hr_gate_decision", {
+        "culture_score": culture_score, "hired": hired, "notes": notes
     })
 
     if not hired:
-        print(f"[ORCH] HR REJECTED → Rejection email")
+        print(f"[ORCH] HR REJECTED")
         _send_rejection_with_growth(candidate_id)
-
-        # Notify HR who posted the JD
         _notify_hr_of_rejection(candidate_id, "hr_interview")
+        return {"status": "rejected", "reason": "failed_hr"}
 
-        return {
-            "status": "rejected",
-            "reason": "failed_hr_interview"
-        }
-
-    # HR approved → Final evaluation
     print(f"[ORCH] HR APPROVED → Final evaluation")
     eval_result = run_evaluator(candidate_id)
     decision    = eval_result.get("decision")
-
     print(f"[ORCH] Final decision: {decision}")
 
     if decision == "HIRE":
         run_communicator(candidate_id, "HIRE")
         _send_growth_report(candidate_id, hired=True)
-
-        # Notify HR who posted the JD — HIRED
-        _notify_hr_of_hire(
-            candidate_id,
-            eval_result.get("final_score", 0),
-            agreed_salary
-        )
+        _notify_hr_of_hire(candidate_id,
+            eval_result.get("final_score", 0), agreed_salary)
     else:
         _send_rejection_with_growth(candidate_id)
         _notify_hr_of_rejection(candidate_id, "final_evaluation")
 
     print(f"[ORCH] ═══ HR GATE COMPLETE ═══\n")
-    return {
-        "status":      "complete",
-        "decision":    decision,
-        "final_score": eval_result.get("final_score")
-    }
+    return {"status": "complete", "decision": decision,
+            "final_score": eval_result.get("final_score")}
 
-# ── HR Notification Functions ────────────────────────────────────
 
-def _notify_hr_of_progress(candidate_id: str,
-                             stage: str,
-                             message: str):
-    """
-    Notify the HR who posted the JD about candidate progress.
-    This ensures HR is always in the loop.
-    """
+# ── HR Notifications ──────────────────────────────────────────────
+
+def _notify_hr_of_progress(candidate_id, stage, message):
     try:
         candidate = get_candidate(candidate_id)
-        hr_id     = candidate.get("hr_id", "")
-
-        if not hr_id:
-            print(f"[ORCH] No HR ID found for candidate {candidate_id}")
-            return
-
-        from shared.cosmos_client import get_hr_user
-        hr = get_hr_user(hr_id)
-        if not hr:
-            print(f"[ORCH] HR user not found: {hr_id}")
-            return
-
-        from agents.communicator.agent import send_email
-        send_email(
-            to_address=hr["email"],
-            subject=f"📊 Pipeline Update: {candidate['name']} — {candidate['applied_role']}",
-            body_html=f"""
-<h2>Candidate Pipeline Update</h2>
-<p>Hi {hr['name']},</p>
-<p>Here is an update on a candidate for the role you posted:</p>
-
-<table style="border-collapse:collapse;width:100%;max-width:500px">
-<tr style="background:#f8fafc">
-    <td style="padding:10px;font-weight:bold">Candidate</td>
-    <td style="padding:10px">{candidate['name']}</td>
-</tr>
-<tr>
-    <td style="padding:10px;font-weight:bold">Role</td>
-    <td style="padding:10px">{candidate['applied_role']}</td>
-</tr>
-<tr style="background:#f8fafc">
-    <td style="padding:10px;font-weight:bold">Stage</td>
-    <td style="padding:10px">{stage.replace('_', ' ').title()}</td>
-</tr>
-<tr>
-    <td style="padding:10px;font-weight:bold">Update</td>
-    <td style="padding:10px">{message}</td>
-</tr>
-<tr style="background:#f8fafc">
-    <td style="padding:10px;font-weight:bold">AI Score</td>
-    <td style="padding:10px">{candidate.get('ai_interview_score', 'N/A')}/100</td>
-</tr>
-</table>
-
-<br>
-<a href="http://localhost:3000"
-   style="background:#6366f1;color:#fff;padding:12px 24px;
-          text-decoration:none;border-radius:8px;font-weight:bold">
-    View in Dashboard →
-</a>
-
-<p style="color:#94a3b8;font-size:12px;margin-top:24px">
-HR Talent Intelligence Swarm — Auto notification
-</p>
-"""
-        )
-        print(f"[ORCH] HR notified: {hr['name']} — {stage}")
-
-    except Exception as e:
-        print(f"[ORCH] HR notification error: {e}")
-
-def _notify_hr_of_rejection(candidate_id: str, stage: str):
-    """Notify HR when a candidate is rejected at any stage."""
-    try:
-        candidate = get_candidate(candidate_id)
-        hr_id     = candidate.get("hr_id", "")
+        hr_id = candidate.get("hr_id", "")
         if not hr_id:
             return
-
         from shared.cosmos_client import get_hr_user
         hr = get_hr_user(hr_id)
         if not hr:
             return
-
-        from agents.communicator.agent import send_email
         send_email(
             to_address=hr["email"],
-            subject=f"❌ Candidate Not Proceeding: {candidate['name']}",
+            subject=f"Pipeline Update: {candidate['name']}",
             body_html=f"""
 <h2>Candidate Update</h2>
 <p>Hi {hr['name']},</p>
-<p><strong>{candidate['name']}</strong> has not proceeded
-further in the pipeline.</p>
-
-<table style="border-collapse:collapse;width:100%;max-width:500px">
-<tr style="background:#fef2f2">
-    <td style="padding:10px;font-weight:bold">Stage</td>
-    <td style="padding:10px">{stage.replace('_', ' ').title()}</td>
-</tr>
-<tr>
-    <td style="padding:10px;font-weight:bold">Resume Score</td>
-    <td style="padding:10px">{candidate.get('resume_score', 'N/A')}/100</td>
-</tr>
-<tr style="background:#fef2f2">
-    <td style="padding:10px;font-weight:bold">AI Score</td>
-    <td style="padding:10px">{candidate.get('ai_interview_score', 'N/A')}/100</td>
-</tr>
-</table>
-
-<p>A personalized growth report has been sent to the candidate.</p>
-
-<a href="http://localhost:3000"
-   style="background:#6366f1;color:#fff;padding:12px 24px;
-          text-decoration:none;border-radius:8px;font-weight:bold">
-    View Pipeline →
-</a>
-"""
-        )
-        print(f"[ORCH] HR notified of rejection: {hr['name']}")
-
+<p><strong>{candidate['name']}</strong> — {candidate['applied_role']}</p>
+<p>Stage: {stage.replace('_',' ').title()}</p>
+<p>{message}</p>
+<p>AI Score: {candidate.get('ai_interview_score','N/A')}/100</p>
+<a href="http://localhost:3000" style="display:inline-block;background:#4f46e5;
+color:#fff;padding:10px 20px;text-decoration:none;border-radius:8px;
+font-weight:bold">View Dashboard</a>
+""")
+        print(f"[ORCH] HR notified: {hr['name']} — {stage}")
     except Exception as e:
-        print(f"[ORCH] HR rejection notification error: {e}")
+        print(f"[ORCH] HR notification error: {e}")
 
-def _notify_hr_of_hire(candidate_id: str,
-                        final_score: float,
-                        agreed_salary: str):
-    """Notify HR when a candidate is hired — the best notification."""
+
+def _notify_hr_of_rejection(candidate_id, stage):
     try:
         candidate = get_candidate(candidate_id)
-        hr_id     = candidate.get("hr_id", "")
+        hr_id = candidate.get("hr_id", "")
         if not hr_id:
             return
-
         from shared.cosmos_client import get_hr_user
         hr = get_hr_user(hr_id)
         if not hr:
             return
-
-        from agents.communicator.agent import send_email
         send_email(
             to_address=hr["email"],
-            subject=f"🎉 Offer Sent: {candidate['name']} — {candidate['applied_role']}",
+            subject=f"Candidate Not Proceeding: {candidate['name']}",
             body_html=f"""
-<h2>🎉 Offer Letter Sent!</h2>
+<h2>Candidate Update</h2>
 <p>Hi {hr['name']},</p>
-<p>Great news! An offer has been sent to
-<strong>{candidate['name']}</strong>.</p>
-
-<table style="border-collapse:collapse;width:100%;max-width:500px">
-<tr style="background:#f0fdf4">
-    <td style="padding:10px;font-weight:bold">Candidate</td>
-    <td style="padding:10px">{candidate['name']}</td>
-</tr>
-<tr>
-    <td style="padding:10px;font-weight:bold">Role</td>
-    <td style="padding:10px">{candidate['applied_role']}</td>
-</tr>
-<tr style="background:#f0fdf4">
-    <td style="padding:10px;font-weight:bold">Final Score</td>
-    <td style="padding:10px;color:#16a34a;font-weight:bold">
-        {final_score}/100
-    </td>
-</tr>
-<tr>
-    <td style="padding:10px;font-weight:bold">Agreed Salary</td>
-    <td style="padding:10px">{agreed_salary}</td>
-</tr>
-<tr style="background:#f0fdf4">
-    <td style="padding:10px;font-weight:bold">Resume Score</td>
-    <td style="padding:10px">{candidate.get('resume_score', 'N/A')}/100</td>
-</tr>
-<tr>
-    <td style="padding:10px;font-weight:bold">AI Interview</td>
-    <td style="padding:10px">{candidate.get('ai_interview_score', 'N/A')}/100</td>
-</tr>
-</table>
-
-<p>The candidate has 5 business days to accept the offer.
-You will be notified when they respond.</p>
-
-<a href="http://localhost:3000"
-   style="background:#16a34a;color:#fff;padding:12px 24px;
-          text-decoration:none;border-radius:8px;font-weight:bold">
-    View in Dashboard →
-</a>
-
-<p style="color:#94a3b8;font-size:12px;margin-top:24px">
-HR Talent Intelligence Swarm — Auto notification
-</p>
-"""
-        )
-        print(f"[ORCH] HR notified of hire: {hr['name']}")
-
+<p><strong>{candidate['name']}</strong> did not proceed past {stage.replace('_',' ')}.</p>
+<p>Resume: {candidate.get('resume_score','N/A')}/100 |
+AI: {candidate.get('ai_interview_score','N/A')}/100</p>
+<p>Growth report sent to candidate.</p>
+""")
     except Exception as e:
-        print(f"[ORCH] HR hire notification error: {e}")
+        print(f"[ORCH] HR rejection notify error: {e}")
 
-# ── Helper Functions ─────────────────────────────────────────────
 
-def _get_resume_text(pdf_bytes: bytes) -> str:
-    """Extract text from PDF or decode as plain text."""
-    import pdfplumber
-    import io
+def _notify_hr_of_hire(candidate_id, final_score, agreed_salary):
+    try:
+        candidate = get_candidate(candidate_id)
+        hr_id = candidate.get("hr_id", "")
+        if not hr_id:
+            return
+        from shared.cosmos_client import get_hr_user
+        hr = get_hr_user(hr_id)
+        if not hr:
+            return
+        send_email(
+            to_address=hr["email"],
+            subject=f"Offer Sent: {candidate['name']}",
+            body_html=f"""
+<h2>Offer Sent!</h2>
+<p>Hi {hr['name']},</p>
+<p><strong>{candidate['name']}</strong> — {candidate['applied_role']}</p>
+<p>Final Score: {final_score}/100 | Salary: {agreed_salary}</p>
+<p>Candidate has 5 business days to accept.</p>
+<a href="http://localhost:3000" style="display:inline-block;background:#059669;
+color:#fff;padding:10px 20px;text-decoration:none;border-radius:8px;
+font-weight:bold">View Dashboard</a>
+""")
+    except Exception as e:
+        print(f"[ORCH] HR hire notify error: {e}")
+
+
+# ── Helpers ───────────────────────────────────────────────────────
+
+def _get_resume_text(pdf_bytes):
+    import pdfplumber, io
     try:
         with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
             text = ""
@@ -615,23 +398,91 @@ def _get_resume_text(pdf_bytes: bytes) -> str:
         except Exception:
             return ""
 
-def _send_rejection_with_growth(candidate_id: str):
-    """Send rejection email + growth report."""
+
+def _send_rejection_with_growth(candidate_id):
     try:
         run_communicator(candidate_id, "REJECT")
         _send_growth_report(candidate_id, hired=False)
     except Exception as e:
         print(f"[ORCH] Rejection email error: {e}")
 
-def _send_growth_report(candidate_id: str, hired: bool):
-    """Generate and send growth report."""
+
+def _send_growth_report(candidate_id, hired):
     try:
         candidate = get_candidate(candidate_id)
-        profile   = candidate.get("ai_profile", {})
+        profile = candidate.get("ai_profile", {})
         if profile:
-            report = generate_growth_report(
-                candidate, profile, hired
-            )
+            report = generate_growth_report(candidate, profile, hired)
             print(f"[ORCH] Growth report: {report.get('subject')}")
     except Exception as e:
         print(f"[ORCH] Growth report error: {e}")
+
+
+def _send_interview_link(candidate_id):
+    """Send AI interview link directly to candidate email."""
+    try:
+        import urllib.parse
+        candidate = get_candidate(candidate_id)
+        if not candidate or not candidate.get("email"):
+            print(f"[ORCH] No email for candidate {candidate_id}")
+            return
+
+        name = urllib.parse.quote(candidate.get("name", "Candidate"))
+        role = urllib.parse.quote(candidate.get("applied_role", ""))
+
+        interview_url = (
+            f"http://localhost:3001"
+            f"?interview={candidate_id}"
+            f"&name={name}&role={role}&rounds=3"
+        )
+
+        send_email(
+            to_address=candidate["email"],
+            subject=f"AI Interview Ready — {candidate.get('applied_role', '')}",
+            body_html=f"""
+<h2>Congratulations, {candidate['name']}!</h2>
+<p>Your resume scored well and you've been selected for
+the AI interview for <strong>{candidate.get('applied_role','')}</strong>.</p>
+
+<table style="border-collapse:collapse;width:100%;max-width:400px;margin:20px 0">
+<tr style="background:#f5f5f4">
+    <td style="padding:10px;font-weight:bold">Format</td>
+    <td style="padding:10px">Text conversation with ARIA (AI)</td>
+</tr>
+<tr>
+    <td style="padding:10px;font-weight:bold">Rounds</td>
+    <td style="padding:10px">3 rounds</td>
+</tr>
+<tr style="background:#f5f5f4">
+    <td style="padding:10px;font-weight:bold">Duration</td>
+    <td style="padding:10px">~8 minutes</td>
+</tr>
+<tr>
+    <td style="padding:10px;font-weight:bold;color:#d97706">Deadline</td>
+    <td style="padding:10px;color:#d97706;font-weight:bold">Complete within 3 days</td>
+</tr>
+</table>
+
+<p><strong>Tips:</strong></p>
+<ul>
+<li>Find a quiet spot with stable internet</li>
+<li>Be specific with real examples from your experience</li>
+<li>Take your time — thoughtful answers beat fast ones</li>
+<li>You can resume once if disconnected</li>
+</ul>
+
+<a href="{interview_url}"
+   style="display:inline-block;background:linear-gradient(135deg,#4f46e5,#6366f1);
+   color:#fff;padding:14px 32px;text-decoration:none;border-radius:12px;
+   font-weight:bold;font-size:16px;margin:16px 0">
+   Start AI Interview
+</a>
+
+<p style="color:#a8a29e;font-size:12px;margin-top:20px">
+This link is unique to you. Do not share it.
+Complete within 3 days to stay in the pipeline.
+</p>
+""")
+        print(f"[ORCH] AI Interview link sent to {candidate['email']}")
+    except Exception as e:
+        print(f"[ORCH] Interview link error: {e}")

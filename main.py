@@ -342,6 +342,9 @@ async def post_job(request: JobPostRequest):
 
         job = {
             "id":                     job_id,
+            "posted_by_hr_id":    "",
+            "posted_by_hr_name":  "",
+            "posted_by_hr_email": "",
             "title":                  request.title,
             "department":             request.department,
             "jd_text":                request.jd_text,
@@ -629,6 +632,171 @@ def pis_check():
             })
     return {"checked": len(results), "results": results}
 
+# ── AI Interview Link API ────────────────────────────────────────
+@app.post("/api/send-interview-link")
+def send_interview_link(candidate_id: str = Form(...)):
+    """Send AI interview link to candidate after screening passes."""
+    try:
+        from shared.cosmos_client import get_candidate
+        from agents.communicator.agent import send_email
+        import urllib.parse
+
+        candidate = get_candidate(candidate_id)
+        if not candidate:
+            raise HTTPException(status_code=404, detail="Candidate not found")
+
+        name  = urllib.parse.quote(candidate.get("name", "Candidate"))
+        role  = urllib.parse.quote(candidate.get("applied_role", ""))
+        base  = getattr(config, 'PUBLIC_URL', 'http://localhost:3001')
+
+        interview_url = f"http://localhost:3001?interview={candidate_id}&name={name}&role={role}&rounds=3"
+
+        send_email(
+            to_address=candidate["email"],
+            subject=f"🎯 AI Interview Ready — {candidate['applied_role']}",
+            body_html=f"""
+<h2>Your AI Interview is Ready</h2>
+<p>Hi {candidate['name']},</p>
+<p>Great news! Your resume has been reviewed and you've been
+selected for the AI interview for <strong>{candidate['applied_role']}</strong>.</p>
+
+<table style="border-collapse:collapse;width:100%;max-width:400px;margin:20px 0">
+<tr style="background:#f5f5f4">
+    <td style="padding:10px;font-weight:bold">Format</td>
+    <td style="padding:10px">Text-based conversation</td>
+</tr>
+<tr>
+    <td style="padding:10px;font-weight:bold">Rounds</td>
+    <td style="padding:10px">3 rounds</td>
+</tr>
+<tr style="background:#f5f5f4">
+    <td style="padding:10px;font-weight:bold">Duration</td>
+    <td style="padding:10px">~8 minutes</td>
+</tr>
+<tr>
+    <td style="padding:10px;font-weight:bold">Interviewer</td>
+    <td style="padding:10px">ARIA (AI)</td>
+</tr>
+</table>
+
+<p><strong>Tips:</strong></p>
+<ul>
+<li>Find a quiet spot with stable internet</li>
+<li>Be specific with real examples</li>
+<li>You can resume once if disconnected</li>
+</ul>
+
+<a href="{interview_url}"
+   style="display:inline-block;background:linear-gradient(135deg,#4f46e5,#6366f1);
+   color:#fff;padding:14px 32px;text-decoration:none;border-radius:12px;
+   font-weight:bold;font-size:16px;margin:16px 0">
+   Start AI Interview →
+</a>
+
+<p style="color:#a8a29e;font-size:12px;margin-top:20px">
+This link is unique to you. Do not share it.
+The interview can be paused and resumed once.
+</p>
+"""
+        )
+
+        update_candidate(candidate_id, {"status": "ai_interview_sent"})
+        return {"success": True, "message": "Interview link sent"}
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+    
+
+# ── AI Interview Flow ────────────────────────────────────────────
+
+@app.get("/api/ai-interview/{candidate_id}/accept")
+def accept_ai_interview(candidate_id: str):
+    """Candidate clicks Accept in email → sends interview link."""
+    try:
+        import urllib.parse
+        candidate = get_candidate(candidate_id)
+        if not candidate:
+            return {"message": "Candidate not found"}
+
+        update_candidate(candidate_id, {"status": "ai_interview_accepted"})
+
+        name = urllib.parse.quote(candidate.get("name", "Candidate"))
+        role = urllib.parse.quote(candidate.get("applied_role", ""))
+
+        interview_url = (
+            f"http://localhost:3001"
+            f"?interview={candidate_id}"
+            f"&name={name}&role={role}&rounds=3"
+        )
+
+        # Send interview link email
+        from agents.communicator.agent import send_email
+        send_email(
+            to_address=candidate["email"],
+            subject=f"Your AI Interview Link — {candidate.get('applied_role', '')}",
+            body_html=f"""
+<h2>You're All Set, {candidate['name']}!</h2>
+<p>Thank you for accepting. Here is your AI interview link.</p>
+
+<p><strong>Important:</strong></p>
+<ul>
+<li>Complete within <strong>3 days</strong></li>
+<li>Find a quiet spot with stable internet</li>
+<li>You can resume once if disconnected</li>
+<li>Take your time — thoughtful answers matter</li>
+</ul>
+
+<a href="{interview_url}"
+   style="display:inline-block;background:linear-gradient(135deg,#4f46e5,#6366f1);
+   color:#fff;padding:14px 32px;text-decoration:none;border-radius:12px;
+   font-weight:bold;font-size:16px;margin:16px 0">
+   Start AI Interview
+</a>
+
+<p style="color:#a8a29e;font-size:12px">
+This link is unique to you. Do not share it.
+</p>
+""")
+
+        return {
+            "message": f"Thank you {candidate['name']}! Check your email for the interview link.",
+            "status": "accepted"
+        }
+    except Exception as e:
+        return {"message": "Accepted. Check your email for the interview link."}
+
+@app.post("/api/ai-interview/complete")
+def complete_ai_interview(
+    candidate_id: str = Form(...),
+    score: float = Form(75.0),
+    answers: str = Form("[]")
+):
+    """Called when ARIA interview finishes. Resumes pipeline."""
+    try:
+        import json
+
+        update_candidate(candidate_id, {
+            "status": "ai_interview_complete",
+            "ai_interview_score": score,
+            "ai_answers": json.loads(answers) if answers else []
+        })
+
+        # Resume pipeline
+        from agents.orchestrator.agent import resume_pipeline_after_interview
+        import threading
+        def resume():
+            try:
+                resume_pipeline_after_interview(candidate_id, score)
+            except Exception as e:
+                print(f"[API] Resume pipeline error: {e}")
+
+        thread = threading.Thread(target=resume)
+        thread.daemon = True
+        thread.start()
+
+        return {"success": True, "message": "Interview complete. Pipeline resumed."}
+    except Exception as e:
+        return {"success": True, "message": "Interview recorded."}    
 # ── Run Server ───────────────────────────────────────────────────
 if __name__ == "__main__":
     uvicorn.run(

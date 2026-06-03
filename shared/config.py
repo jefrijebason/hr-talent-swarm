@@ -43,3 +43,5 @@ class Config:
     DEMO_MODE                   = os.getenv("DEMO_MODE", "false").lower() == "true"
 
 config = Config()
+
+PUBLIC_URL: str = os.getenv("PUBLIC_URL", "http://localhost:8000")
