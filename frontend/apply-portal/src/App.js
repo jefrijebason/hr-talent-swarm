@@ -63,6 +63,7 @@ export default function App() {
   if (page === 'interview' && interviewData) {
     return (
       <InterviewPage
+        candidateId={interviewData.token}
         candidateName={interviewData.candidateName}
         roleName={interviewData.roleName}
         roundsTotal={interviewData.roundsTotal}

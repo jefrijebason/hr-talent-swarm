@@ -45,7 +45,26 @@ Return ONLY valid JSON:
 """
 
     response = ask_gpt4o(prompt)
-    return parse_json(response)
+    try:
+        parsed = parse_json(response)
+        if not parsed or not isinstance(parsed, dict):
+            raise ValueError("parse_json returned empty or invalid result")
+        return parsed
+    except Exception as e:
+        print(f"[EVALUATOR] Failed to parse evaluation response: {e}")
+        # Fallback conservative evaluation
+        return {
+            "technical_accuracy": 50,
+            "depth": 20,
+            "ai_thinking": 0,
+            "communication": 40,
+            "overall": 35,
+            "strengths": ["Response received but parsing failed"],
+            "weaknesses": ["Evaluator parsing error"],
+            "verdict": "Weak",
+            "follow_up_needed": True,
+            "reasoning": "Evaluator parsing failed; using conservative fallback"
+        }
 
 def evaluate_prompt(candidate_prompt: str,
                     test_data: str,

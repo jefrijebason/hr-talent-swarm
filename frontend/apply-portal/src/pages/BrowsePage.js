@@ -6,13 +6,14 @@ import {
   GlassCard, AuroraButton, GradientText, SkillPill,
   GlassInput, StatChip, ScrollReveal, AnimatedCounter
 } from '../components';
-import { MOCK_JOBS, FILTER_OPTIONS } from '../mockData';
+import { FILTER_OPTIONS } from '../mockData';
 
 const API_URL = process.env.REACT_APP_API_URL || 'http://localhost:8000';
 
 export default function BrowsePage({ onSelectJob }) {
-  const [jobs, setJobs]         = useState(MOCK_JOBS);
-  const [selected, setSelected] = useState(MOCK_JOBS[0]);
+  const [jobs, setJobs]         = useState([]);
+  const [selected, setSelected] = useState(null);
+  const [isLoading, setIsLoading] = useState(true);
   const [search, setSearch]     = useState('');
   const [loc, setLoc]           = useState('All Locations');
   const [dept, setDept]         = useState('All Departments');
@@ -26,15 +27,22 @@ export default function BrowsePage({ onSelectJob }) {
   }, []);
 
   useEffect(() => {
+    setIsLoading(true);
     axios.get(`${API_URL}/api/jobs`)
       .then(r => {
         if (r.data && r.data.length > 0) {
-          const merged = r.data.map(j => ({ ...MOCK_JOBS[0], ...j }));
-          setJobs(merged);
-          setSelected(merged[0]);
+          setJobs(r.data);
+          setSelected(r.data[0]);
+        } else {
+          setJobs([]);
+          setSelected(null);
         }
       })
-      .catch(() => {});
+      .catch(() => {
+        setJobs([]);
+        setSelected(null);
+      })
+      .finally(() => setIsLoading(false));
   }, []);
 
   const filtered = jobs.filter(j => {
@@ -45,6 +53,42 @@ export default function BrowsePage({ onSelectJob }) {
     const matchDept = dept === 'All Departments' || j.department === dept;
     return matchSearch && matchLoc && matchDept;
   });
+
+  // Show loading skeleton while fetching
+  if (isLoading) {
+    return (
+      <div style={{ maxWidth: '1200px', margin: '0 auto', padding: '40px 24px 80px' }}>
+        <div style={{ textAlign: 'center', marginBottom: '40px', opacity: 0.6 }}>
+          <h1 style={{ ...fonts.display, margin: '0 0 14px' }}>
+            <GradientText>Loading roles...</GradientText>
+          </h1>
+          <p style={{ ...fonts.body, color: theme.textSecondary, margin: '0' }}>Fetching live job listings</p>
+        </div>
+        <div style={{ display: 'grid', gridTemplateColumns: isMobile ? '1fr' : '380px 1fr', gap: '20px' }}>
+          <div style={{ display: 'flex', flexDirection: 'column', gap: '14px' }}>
+            {[1, 2, 3].map(i => (
+              <motion.div key={i}
+                animate={{ opacity: [0.5, 1, 0.5] }}
+                transition={{ duration: 2, repeat: Infinity }}>
+                <GlassCard style={{ padding: '18px', height: '140px', background: 'rgba(255,255,255,0.04)' }} />
+              </motion.div>
+            ))}
+          </div>
+        </div>
+      </div>
+    );
+  }
+
+  // Show empty state if no jobs
+  if (jobs.length === 0) {
+    return (
+      <div style={{ maxWidth: '1200px', margin: '0 auto', padding: '60px 24px 80px', textAlign: 'center' }}>
+        <h2 style={{ ...fonts.h1, color: theme.textPrimary, marginBottom: '12px' }}>No roles available</h2>
+        <p style={{ ...fonts.body, color: theme.textSecondary, marginBottom: '28px' }}>Check back soon or contact HR for updates.</p>
+        <AuroraButton onClick={() => window.location.reload()}>Refresh</AuroraButton>
+      </div>
+    );
+  }
 
   return (
     <div style={{ maxWidth: '1200px', margin: '0 auto', padding: '40px 24px 80px' }}>

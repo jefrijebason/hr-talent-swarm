@@ -1,6 +1,6 @@
 from shared.cosmos_client import (
     save_candidate, get_candidate,
-    update_candidate, write_audit
+    update_candidate, write_audit, get_job
 )
 from shared.openai_client import ask_gpt4o, parse_json
 from shared.service_bus import publish_human_gate
@@ -152,6 +152,34 @@ def resume_pipeline_after_interview(candidate_id, ai_score):
         "ai_score":     ai_score,
         "combined":     combined_ai
     })
+
+    job = None
+    if job_id:
+        job = get_job(job_id)
+
+    if job and job.get("coding_round_enabled"):
+        print(f"[ORCH] Coding round enabled for job {job_id}. Sending coding assessment.")
+        _send_coding_assessment_link(candidate_id, job_id)
+
+        update_candidate(candidate_id, {
+            "status": "coding_sent"
+        })
+
+        write_audit(candidate_id, "ORCHESTRATOR",
+                    "coding_sent", {
+            "job_id": job_id,
+            "combined_ai_score": combined_ai
+        })
+
+        _notify_hr_of_progress(candidate_id, "coding_assessment_sent",
+            f"Candidate passed AI and coding assessment link has been sent. Score: {ai_score}/100.")
+
+        print(f"[ORCH] ═══ PIPELINE PAUSED — CODING SENT ═══\n")
+        return {
+            "status":        "coding_sent",
+            "combined":      combined_ai,
+            "coding_needed": True
+        }
 
     assign_result = _assign_interviewer(
         candidate_id, job_id, hr_id, "technical"
@@ -486,3 +514,88 @@ Complete within 3 days to stay in the pipeline.
         print(f"[ORCH] AI Interview link sent to {candidate['email']}")
     except Exception as e:
         print(f"[ORCH] Interview link error: {e}")
+
+
+def _send_coding_assessment_link(candidate_id, job_id=None):
+    """Send coding assessment link to the candidate."""
+    try:
+        import urllib.parse
+        candidate = get_candidate(candidate_id)
+        if not candidate or not candidate.get("email"):
+            print(f"[ORCH] No email for candidate {candidate_id}")
+            return
+
+        job_param = urllib.parse.quote(job_id or "")
+        name = urllib.parse.quote(candidate.get("name", "Candidate"))
+        role = urllib.parse.quote(candidate.get("applied_role", ""))
+
+        coding_url = (
+            f"http://localhost:3002"
+            f"?candidate={candidate_id}"
+            f"&job={job_param}"
+            f"&name={name}&role={role}"
+        )
+
+        send_email(
+            to_address=candidate["email"],
+            subject=f"Coding Assessment Ready — {candidate.get('applied_role', '')}",
+            body_html=f"""
+<h2>Hello {candidate['name']},</h2>
+<p>Your AI interview was successful and you're now invited to complete
+the coding assessment for <strong>{candidate.get('applied_role','')}</strong>.</p>
+<p>Complete the assessment within 3 days to stay in the process.</p>
+<p><strong>What to expect:</strong></p>
+<ul>
+<li>One practical coding assignment</li>
+<li>Run your code against test cases</li>
+<li>Answer a short follow-up review</li>
+</ul>
+<a href="{coding_url}"
+   style="display:inline-block;background:linear-gradient(135deg,#4f46e5,#6366f1);
+   color:#fff;padding:14px 32px;text-decoration:none;border-radius:12px;
+   font-weight:bold;font-size:16px;margin:16px 0">
+   Start Coding Assessment
+</a>
+<p style="color:#a8a29e;font-size:12px">
+This link is unique to you. Do not share it.
+</p>
+"""
+        )
+        print(f"[ORCH] Coding assessment link sent to {candidate['email']}")
+    except Exception as e:
+        print(f"[ORCH] Coding link error: {e}")
+
+
+def resume_pipeline_after_coding(candidate_id: str):
+    """Route candidate to the technical interview after coding completes."""
+    print(f"\n[ORCH] ═══ CODING ROUTE: {candidate_id} ═══")
+    try:
+        candidate = get_candidate(candidate_id)
+        if not candidate:
+            print(f"[ORCH] Candidate not found: {candidate_id}")
+            return {"status": "missing_candidate"}
+
+        job_id = candidate.get("job_id", "")
+        hr_id  = candidate.get("hr_id", "")
+
+        update_candidate(candidate_id, {
+            "status": "waiting_technical_interview"
+        })
+
+        write_audit(candidate_id, "ORCHESTRATOR", "coding_complete_routed", {
+            "job_id": job_id,
+            "coding_score": candidate.get("coding_score")
+        })
+
+        assign_result = _assign_interviewer(
+            candidate_id, job_id, hr_id, "technical"
+        )
+
+        _notify_hr_of_progress(candidate_id, "coding_completed",
+            f"Candidate completed coding and is being routed to technical interview.")
+
+        print(f"[ORCH] Coding complete routed: {assign_result}")
+        return {"status": "waiting_technical_interview", "assignment": assign_result}
+    except Exception as e:
+        print(f"[ORCH] Coding resume error: {e}")
+        return {"status": "error", "error": str(e)}

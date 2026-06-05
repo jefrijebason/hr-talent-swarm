@@ -4,92 +4,6 @@ import './App.css';
 
 const API_URL = process.env.REACT_APP_API_URL || 'http://localhost:8000';
 
-const MOCK_CANDIDATES = [
-  {
-    id: 'cand_001', name: 'Arjun Mehta',
-    applied_role: 'Senior AI Engineer',
-    status: 'hired', resume_score: 90,
-    ai_interview_score: 85, final_score: 87.9,
-    decision: 'HIRE', expected_ctc: '20 LPA',
-    skills: ['Python', 'Azure', 'ML', 'FastAPI'],
-    profile_type: 'strong'
-  },
-  {
-    id: 'cand_002', name: 'Priya Sharma',
-    applied_role: 'Senior AI Engineer',
-    status: 'hired', resume_score: 88,
-    ai_interview_score: 82, final_score: 85.4,
-    decision: 'HIRE', expected_ctc: '18 LPA',
-    skills: ['Python', 'Azure ML', 'Docker'],
-    profile_type: 'strong'
-  },
-  {
-    id: 'cand_003', name: 'Rahul Verma',
-    applied_role: 'Senior AI Engineer',
-    status: 'waiting_technical_interview',
-    resume_score: 86, ai_interview_score: 80,
-    final_score: null, decision: null,
-    expected_ctc: '22 LPA',
-    skills: ['Python', 'Kubernetes', 'NLP'],
-    profile_type: 'strong'
-  },
-  {
-    id: 'cand_004', name: 'Sneha Patel',
-    applied_role: 'Senior AI Engineer',
-    status: 'rejected', resume_score: 62,
-    ai_interview_score: 58, final_score: 60.2,
-    decision: 'NO_HIRE', expected_ctc: '15 LPA',
-    skills: ['Python', 'Django', 'MySQL'],
-    profile_type: 'borderline'
-  },
-  {
-    id: 'cand_005', name: 'Karan Singh',
-    applied_role: 'Senior AI Engineer',
-    status: 'rejected', resume_score: 58,
-    ai_interview_score: null, final_score: null,
-    decision: 'NO_HIRE', expected_ctc: '16 LPA',
-    skills: ['Python', 'Flask'],
-    profile_type: 'borderline'
-  },
-  {
-    id: 'cand_006', name: 'Ravi Kumar',
-    applied_role: 'Senior AI Engineer',
-    status: 'rejected', resume_score: 18,
-    ai_interview_score: null, final_score: null,
-    decision: 'NO_HIRE', expected_ctc: '12 LPA',
-    skills: ['Excel', 'Tally', 'SAP'],
-    profile_type: 'reject'
-  },
-  {
-    id: 'cand_007', name: 'Deepa Nair',
-    applied_role: 'Senior AI Engineer',
-    status: 'rejected', resume_score: 15,
-    ai_interview_score: null, final_score: null,
-    decision: 'NO_HIRE', expected_ctc: '10 LPA',
-    skills: ['Accounting', 'GST', 'Tally'],
-    profile_type: 'reject'
-  },
-];
-
-const MOCK_LOGS = [
-  { time: '10:42:01', agent: 'ORCHESTRATOR', msg: 'New application: Arjun Mehta',         color: '#6366f1' },
-  { time: '10:42:03', agent: 'SCREENER',     msg: 'Resume uploaded to Blob Storage',       color: '#0891b2' },
-  { time: '10:42:05', agent: 'SCREENER',     msg: 'Bias removal complete',                 color: '#0891b2' },
-  { time: '10:42:08', agent: 'SCREENER',     msg: 'Score: 90/100 — Strong candidate',      color: '#0891b2' },
-  { time: '10:42:09', agent: 'ORCHESTRATOR', msg: 'Routing to AI Interviewer',             color: '#6366f1' },
-  { time: '10:42:12', agent: 'JD INTEL',     msg: 'Role: ai_ml | Level: senior',           color: '#7c3aed' },
-  { time: '10:42:15', agent: 'AWARENESS',    msg: 'Latest tech check complete',            color: '#7c3aed' },
-  { time: '10:42:20', agent: 'INTERVIEWER',  msg: 'Round 1 score: 88/100',                color: '#d97706' },
-  { time: '10:42:35', agent: 'INTERVIEWER',  msg: 'Round 2 score: 82/100',                color: '#d97706' },
-  { time: '10:42:50', agent: 'INTERVIEWER',  msg: 'Round 3 score: 85/100',                color: '#d97706' },
-  { time: '10:43:05', agent: 'INTERVIEWER',  msg: 'Round 4 score: 83/100',                color: '#d97706' },
-  { time: '10:43:10', agent: 'INTERVIEWER',  msg: 'AI Readiness: AI-Native | Top 12%',    color: '#d97706' },
-  { time: '10:43:12', agent: 'SCHEDULER',    msg: 'Reading calendars via Graph API',       color: '#059669' },
-  { time: '10:43:14', agent: 'SCHEDULER',    msg: 'Teams meeting booked: Mon 10:00 AM',    color: '#059669' },
-  { time: '10:43:15', agent: 'COMMUNICATOR', msg: 'Invite sent to candidate',              color: '#dc2626' },
-  { time: '10:43:16', agent: 'ORCHESTRATOR', msg: 'Pipeline paused — awaiting human',      color: '#6366f1' },
-];
-
 const STATUS_COLUMNS = [
   { key: 'applied',                     label: 'Applied',       color: '#6366f1' },
   { key: 'screened',                    label: 'Screened',      color: '#0891b2' },
@@ -1014,18 +928,27 @@ function JobPostingView() {
 
 // ── Main App ─────────────────────────────────────────────────────
 export default function App() {
-  const [view, setView]             = useState('jobs');
-  const [candidates, setCandidates] = useState(MOCK_CANDIDATES);
-  const [selected, setSelected]     = useState(null);
+  const [view, setView]                 = useState('jobs');
+  const [candidates, setCandidates]     = useState([]);
+  const [isCandidatesLoading, setIsCandidatesLoading] = useState(true);
+  const [selected, setSelected]         = useState(null);
   const [approvalForm, setApprovalForm] = useState({
     tech_score: '', culture_score: '', notes: '', salary: '', round: 'technical'
   });
 
   useEffect(() => {
     const load = () => {
+      setIsCandidatesLoading(true);
       axios.get(`${API_URL}/api/candidates`)
-        .then(r => { if (r.data?.length > 0) setCandidates(r.data); })
-        .catch(() => {});
+        .then(r => {
+          setCandidates(r.data || []);
+        })
+        .catch(() => {
+          setCandidates([]);
+        })
+        .finally(() => {
+          setIsCandidatesLoading(false);
+        });
     };
     load();
     const interval = setInterval(load, 10000);
@@ -1121,61 +1044,77 @@ export default function App() {
         {/* Pipeline View */}
         {view === 'pipeline' && (
           <div>
-            <div style={s.kanban}>
-              {STATUS_COLUMNS.map(col => (
-                <div key={col.key} style={s.column}>
-                  <div style={{ ...s.colHeader, borderTop: `3px solid ${col.color}` }}>
-                    <span style={{ color: col.color, fontWeight: 700, fontSize: '12px' }}>
-                      {col.label}
-                    </span>
-                    <span style={s.colCount}>
-                      {candidates.filter(c => c.status === col.key).length}
-                    </span>
-                  </div>
-                  {candidates.filter(c => c.status === col.key).map(c => (
-                    <div key={c.id} style={s.candidateCard} onClick={() => setSelected(c)}>
-                      <div style={s.cardName}>{c.name}</div>
-                      <div style={s.cardRole}>{c.applied_role}</div>
-                      {c.resume_score && (
-                        <div style={s.scoreRow}>
-                          <span style={s.scoreLabel}>Resume</span>
-                          <span style={{ ...s.scoreBadge,
-                            background: c.resume_score >= 70 ? '#dcfce7' : '#fef9c3',
-                            color: c.resume_score >= 70 ? '#15803d' : '#92400e' }}>
-                            {c.resume_score}/100
-                          </span>
+            {isCandidatesLoading ? (
+              <div style={{ padding: '40px 24px', textAlign: 'center', color: '#94a3b8' }}>
+                <div style={{ fontSize: '18px', fontWeight: 600, marginBottom: '8px' }}>Loading candidates...</div>
+                <div style={{ maxWidth: '560px', margin: '0 auto' }}>
+                  Fetching current pipeline data from the API. Please wait a moment.
+                </div>
+              </div>
+            ) : candidates.length === 0 ? (
+              <div style={{ padding: '40px 24px', textAlign: 'center', color: '#94a3b8' }}>
+                <div style={{ fontSize: '18px', fontWeight: 600, marginBottom: '8px' }}>No candidates yet</div>
+                <div style={{ maxWidth: '560px', margin: '0 auto' }}>
+                  Candidate applications will appear here once they are submitted.
+                </div>
+              </div>
+            ) : (
+              <div>
+                <div style={s.kanban}>
+                  {STATUS_COLUMNS.map(col => (
+                    <div key={col.key} style={s.column}>
+                      <div style={{ ...s.colHeader, borderTop: `3px solid ${col.color}` }}>
+                        <span style={{ color: col.color, fontWeight: 700, fontSize: '12px' }}>
+                          {col.label}
+                        </span>
+                        <span style={s.colCount}>
+                          {candidates.filter(c => c.status === col.key).length}
+                        </span>
+                      </div>
+                      {candidates.filter(c => c.status === col.key).map(c => (
+                        <div key={c.id} style={s.candidateCard} onClick={() => setSelected(c)}>
+                          <div style={s.cardName}>{c.name}</div>
+                          <div style={s.cardRole}>{c.applied_role}</div>
+                          {c.resume_score && (
+                            <div style={s.scoreRow}>
+                              <span style={s.scoreLabel}>Resume</span>
+                              <span style={{ ...s.scoreBadge,
+                                background: c.resume_score >= 70 ? '#dcfce7' : '#fef9c3',
+                                color: c.resume_score >= 70 ? '#15803d' : '#92400e' }}>
+                                {c.resume_score}/100
+                              </span>
+                            </div>
+                          )}
+                          {c.ai_interview_score && (
+                            <div style={s.scoreRow}>
+                              <span style={s.scoreLabel}>AI Interview</span>
+                              <span style={{ ...s.scoreBadge,
+                                background: '#eff6ff', color: '#1d4ed8' }}>
+                                {c.ai_interview_score}/100
+                              </span>
+                            </div>
+                          )}
+                          {c.final_score && (
+                            <div style={s.scoreRow}>
+                              <span style={s.scoreLabel}>Final</span>
+                              <span style={{ ...s.scoreBadge,
+                                background: c.decision === 'HIRE' ? '#dcfce7' : '#fef2f2',
+                                color: c.decision === 'HIRE' ? '#15803d' : '#dc2626',
+                                fontWeight: 700 }}>
+                                {c.final_score}/100
+                              </span>
+                            </div>
+                          )}
+                          {c.status === 'waiting_technical_interview' && (
+                            <div style={s.actionBadge}>⏳ Awaiting your feedback</div>
+                          )}
                         </div>
-                      )}
-                      {c.ai_interview_score && (
-                        <div style={s.scoreRow}>
-                          <span style={s.scoreLabel}>AI Interview</span>
-                          <span style={{ ...s.scoreBadge,
-                            background: '#eff6ff', color: '#1d4ed8' }}>
-                            {c.ai_interview_score}/100
-                          </span>
-                        </div>
-                      )}
-                      {c.final_score && (
-                        <div style={s.scoreRow}>
-                          <span style={s.scoreLabel}>Final</span>
-                          <span style={{ ...s.scoreBadge,
-                            background: c.decision === 'HIRE' ? '#dcfce7' : '#fef2f2',
-                            color: c.decision === 'HIRE' ? '#15803d' : '#dc2626',
-                            fontWeight: 700 }}>
-                            {c.final_score}/100
-                          </span>
-                        </div>
-                      )}
-                      {c.status === 'waiting_technical_interview' && (
-                        <div style={s.actionBadge}>⏳ Awaiting your feedback</div>
-                      )}
+                      ))}
                     </div>
                   ))}
                 </div>
-              ))}
-            </div>
 
-            {selected && (
+                {selected && (
               <div style={s.overlay} onClick={() => setSelected(null)}>
                 <div style={s.panel} onClick={e => e.stopPropagation()}>
                   <button style={s.closeBtn} onClick={() => setSelected(null)}>✕</button>
@@ -1261,15 +1200,9 @@ export default function App() {
               </span>
             </div>
             <div style={s.feedLog}>
-              {[...MOCK_LOGS].reverse().map((log, i) => (
-                <div key={i} style={{ ...s.logEntry,
-                  opacity: Math.max(0.3, 1 - i * 0.05),
-                  background: i === 0 ? '#1e293b' : 'transparent' }}>
-                  <span style={s.logTime}>{log.time}</span>
-                  <span style={{ ...s.logAgent, color: log.color }}>[{log.agent}]</span>
-                  <span style={s.logMsg}>{log.msg}</span>
-                </div>
-              ))}
+              <div style={{ padding: '28px', color: '#94a3b8', textAlign: 'center' }}>
+                Agent activity will appear here when a candidate is being processed.
+              </div>
             </div>
           </div>
         )}

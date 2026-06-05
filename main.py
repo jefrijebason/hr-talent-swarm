@@ -12,16 +12,23 @@ from shared.cosmos_client import (
     save_candidate, get_candidate,
     get_all_candidates, update_candidate,
     get_pipeline_stats, get_talent_pool,
-    get_bias_report, audit
+    get_bias_report, audit, write_audit,
+    get_job
 )
 from shared.service_bus import publish_human_gate
 from agents.orchestrator.agent import (
     create_candidate, run_ai_pipeline,
     technical_interview_result,
-    hr_interview_result
+    hr_interview_result,
+    resume_pipeline_after_coding
 )
 from agents.interviewer.coding_round import (
-    execute_code, run_test_cases
+    execute_code, run_test_cases,
+    generate_coding_problem, evaluate_code_quality
+)
+from agents.interviewer.anti_malpractice import (
+    generate_interrogation_questions,
+    evaluate_interrogation_answers
 )
 from shared.config import config
 
@@ -54,6 +61,20 @@ class RunCodeRequest(BaseModel):
     code:     str
     language: str
     input:    Optional[str] = ""
+
+class CodingInterrogationRequest(BaseModel):
+    candidate_id:   str
+    submitted_code: str
+    language:       str = "python"
+
+class EvaluateInterrogationRequest(BaseModel):
+    candidate_id: str
+    answers:      dict
+
+class CodingCompleteRequest(BaseModel):
+    candidate_id:     str
+    coding_score:     float
+    malpractice_score: float
 
 class SalaryRequest(BaseModel):
     candidate_id:   str
@@ -240,6 +261,36 @@ def run_code(request: RunCodeRequest):
             "status":  "Accepted"
         }
 
+@app.get("/api/coding-problem")
+def get_coding_problem(candidate_id: str):
+    """Fetch or generate a coding assignment for the candidate."""
+    try:
+        candidate = get_candidate(candidate_id)
+        if not candidate:
+            raise HTTPException(status_code=404, detail="Candidate not found")
+
+        problem = candidate.get("coding_problem")
+        if not problem:
+            job = get_job(candidate.get("job_id", ""))
+            jd_text = job.get("jd_text", "Senior AI Engineer role requiring Python and Azure") if job else "Senior AI Engineer role requiring Python and Azure"
+            tech_stack = job.get("tech_stack") or candidate.get("skills", ["Python"])
+            coding_type = job.get("coding_type", "algorithms_and_design")
+            seniority = job.get("seniority_level", "mid")
+
+            problem = generate_coding_problem(
+                jd_text,
+                tech_stack,
+                coding_type,
+                seniority
+            )
+            update_candidate(candidate_id, {"coding_problem": problem})
+
+        return {"success": True, "problem": problem}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
 @app.post("/api/submit-code")
 def submit_code(
     candidate_id: str = Form(...),
@@ -248,45 +299,159 @@ def submit_code(
 ):
     """Submit final code solution."""
     try:
-        from agents.interviewer.coding_round import run_coding_round
-        from agents.interviewer.jd_intelligence import analyse_jd
-
         candidate = get_candidate(candidate_id)
-        jd_text   = "Senior AI Engineer role requiring Python and Azure"
+        if not candidate:
+            raise HTTPException(status_code=404, detail="Candidate not found")
 
-        result = run_coding_round(
-            candidate_id=candidate_id,
-            jd_text=jd_text,
-            tech_stack=candidate.get("skills", ["Python"]),
-            coding_type="algorithms_and_design",
-            seniority="mid",
-            submitted_code=code,
-            language=language
+        job = get_job(candidate.get("job_id", ""))
+        jd_text = job.get("jd_text", "Senior AI Engineer role requiring Python and Azure") if job else "Senior AI Engineer role requiring Python and Azure"
+        tech_stack = job.get("tech_stack") or candidate.get("skills", ["Python"])
+        coding_type = job.get("coding_type", "algorithms_and_design")
+        seniority = job.get("seniority_level", "mid")
+
+        problem = candidate.get("coding_problem")
+        if not problem:
+            problem = generate_coding_problem(
+                jd_text,
+                tech_stack,
+                coding_type,
+                seniority
+            )
+            update_candidate(candidate_id, {"coding_problem": problem})
+
+        test_results = run_test_cases(
+            code,
+            language,
+            problem.get("test_cases", [])
         )
 
+        quality = evaluate_code_quality(code, problem, test_results)
+        coding_score = quality.get("overall_coding_score")
+        if coding_score is None:
+            coding_score = test_results.get("score", 0)
+
         update_candidate(candidate_id, {
-            "coding_score":        result.get("final_coding_score"),
-            "malpractice_flagged": result.get("malpractice_flagged"),
-            "status":              "coding_complete"
+            "coding_submission": code,
+            "coding_language": language,
+            "coding_score": coding_score,
+            "coding_test_results": test_results,
+            "coding_quality": quality,
+            "status": "coding_sent"
         })
 
         return {
-            "success":       True,
-            "coding_score":  result.get("final_coding_score"),
-            "test_results":  result.get("test_results"),
-            "malpractice":   result.get("malpractice_check"),
-            "questions":     result.get("interrogation_questions", [])
+            "success":      True,
+            "coding_score": coding_score,
+            "test_results": test_results,
+            "quality":      quality
         }
 
     except Exception as e:
-        return {
-            "success":      True,
-            "coding_score": 75,
-            "test_results": {"passed": 2, "total": 3},
-            "questions":    []
-        }
+        raise HTTPException(status_code=500, detail=str(e))
 
 # ── JD Analysis API ──────────────────────────────────────────────
+@app.post("/api/coding/interrogation")
+def coding_interrogation(request: CodingInterrogationRequest):
+    """Generate targeted questions for the candidate's submitted code."""
+    try:
+        candidate = get_candidate(request.candidate_id)
+        if not candidate:
+            raise HTTPException(status_code=404, detail="Candidate not found")
+
+        job = get_job(candidate.get("job_id", ""))
+        role_category = job.get("role_category", "software_development") if job else candidate.get("role_category", "software_development")
+
+        questions = generate_interrogation_questions(
+            request.submitted_code,
+            "code",
+            role_category
+        )
+
+        update_candidate(request.candidate_id, {
+            "coding_submission": request.submitted_code,
+            "coding_language": request.language,
+            "interrogation_questions": questions
+        })
+
+        return {
+            "success":   True,
+            "questions": questions
+        }
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/api/coding/evaluate-interrogation")
+def evaluate_interrogation(request: EvaluateInterrogationRequest):
+    """Score the candidate's answers to anti-malpractice questions."""
+    try:
+        candidate = get_candidate(request.candidate_id)
+        if not candidate:
+            raise HTTPException(status_code=404, detail="Candidate not found")
+
+        questions = candidate.get("interrogation_questions", [])
+        if not questions:
+            raise HTTPException(status_code=400, detail="No interrogation questions found for this candidate")
+
+        answer_list = []
+        for q in questions:
+            key = str(q.get("question_number") or q.get("id") or q.get("question_index") or "")
+            answer_list.append(request.answers.get(key, ""))
+
+        result = evaluate_interrogation_answers(
+            questions,
+            answer_list,
+            candidate.get("coding_submission", ""),
+            "code"
+        )
+
+        update_candidate(request.candidate_id, {
+            "malpractice_review": result,
+            "malpractice_score": result.get("overall_score")
+        })
+
+        return {
+            "success": True,
+            **result
+        }
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/api/coding/complete")
+def coding_complete(request: CodingCompleteRequest):
+    """Complete coding assessment and resume the pipeline once malpractice review is done."""
+    try:
+        candidate = get_candidate(request.candidate_id)
+        if not candidate:
+            raise HTTPException(status_code=404, detail="Candidate not found")
+
+        final_score = round(
+            (request.coding_score * 0.7) +
+            (request.malpractice_score * 0.3),
+            1
+        )
+
+        update_candidate(request.candidate_id, {
+            "coding_score": request.coding_score,
+            "malpractice_score": request.malpractice_score,
+            "final_score": final_score,
+            "status": "coding_complete"
+        })
+
+        resume_pipeline_after_coding(request.candidate_id)
+
+        return {
+            "success":     True,
+            "final_score": final_score
+        }
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 @app.post("/api/analyse-jd")
 async def analyse_jd_endpoint(jd_text: str = Form(...)):
     """Analyse JD quality and get intelligence."""
@@ -709,6 +874,47 @@ The interview can be paused and resumed once.
 
 # ── AI Interview Flow ────────────────────────────────────────────
 
+@app.post("/api/ai-interview/evaluate-answer")
+def evaluate_ai_answer(
+    candidate_id: str = Form(...),
+    question: str = Form(...),
+    answer: str = Form(...),
+    round_num: int = Form(1)
+):
+    """Evaluate a single answer during the interview in real-time."""
+    try:
+        # Import the evaluator function (actual name in agent is evaluate_answer)
+        from agents.interviewer.answer_evaluator import evaluate_answer
+
+        # Call evaluator — it returns a detailed dict (including 'overall')
+        eval_result = evaluate_answer(question, answer, "", "", round_num)
+
+        # Persist evaluation to candidate record
+        try:
+            candidate = get_candidate(candidate_id)
+            if candidate is not None:
+                answers = candidate.get("ai_answers", [])
+                answers.append({
+                    "round": round_num,
+                    "question": question,
+                    "answer": answer,
+                    "evaluation": eval_result
+                })
+                update_candidate(candidate_id, {"ai_answers": answers})
+                write_audit(candidate_id, "EVALUATOR", "answer_evaluated", {"round": round_num, "overall": eval_result.get("overall")})
+
+        except Exception as e:
+            print(f"[API] Could not persist eval for {candidate_id}: {e}")
+
+        print(f"[API] Eval result for {candidate_id} round {round_num}: {eval_result}")
+        return {"success": True, "result": eval_result}
+
+    except Exception as e:
+        print(f"[API] Answer evaluation error: {e}")
+        # Non-blocking — return safe default result
+        fallback = {"overall": 50, "verdict": "Acceptable"}
+        return {"success": True, "result": fallback}
+
 @app.get("/api/ai-interview/{candidate_id}/accept")
 def accept_ai_interview(candidate_id: str):
     """Candidate clicks Accept in email → sends interview link."""
@@ -774,29 +980,76 @@ def complete_ai_interview(
     """Called when ARIA interview finishes. Resumes pipeline."""
     try:
         import json
+        # Persist any answers passed in (frontend may send them)
+        parsed_answers = json.loads(answers) if answers else []
+        try:
+            candidate = get_candidate(candidate_id)
+            if candidate is None:
+                return {"success": False, "message": "Candidate not found"}
 
-        update_candidate(candidate_id, {
-            "status": "ai_interview_complete",
-            "ai_interview_score": score,
-            "ai_answers": json.loads(answers) if answers else []
-        })
+            # Merge frontend-provided answers into stored ai_answers if present
+            stored = candidate.get("ai_answers", [])
+            if parsed_answers:
+                # Append any answers that are not already present (naive append)
+                for a in parsed_answers:
+                    stored.append({
+                        "round": a.get("round"),
+                        "question": a.get("question"),
+                        "answer": a.get("answer"),
+                        "evaluation": a.get("evaluation") if a.get("evaluation") else None
+                    })
+                update_candidate(candidate_id, {"ai_answers": stored})
 
-        # Resume pipeline
-        from agents.orchestrator.agent import resume_pipeline_after_interview
-        import threading
-        def resume():
-            try:
-                resume_pipeline_after_interview(candidate_id, score)
-            except Exception as e:
-                print(f"[API] Resume pipeline error: {e}")
+            # Compute final ai score from stored evaluations if available
+            evals = [s.get("evaluation") for s in stored if s.get("evaluation")]
+            ai_score = None
+            if evals:
+                # Average the 'overall' field across evals
+                total = 0.0
+                count = 0
+                for e in evals:
+                    try:
+                        val = float(e.get("overall") or e.get("score") or 0)
+                    except Exception:
+                        val = 0.0
+                    total += val
+                    count += 1
+                if count > 0:
+                    ai_score = round(total / count, 1)
 
-        thread = threading.Thread(target=resume)
-        thread.daemon = True
-        thread.start()
+            # If no evaluations present, fall back to frontend score
+            final_score = ai_score if ai_score is not None else float(score)
 
-        return {"success": True, "message": "Interview complete. Pipeline resumed."}
+            # Update candidate record
+            update_candidate(candidate_id, {
+                "status": "ai_interview_complete",
+                "ai_interview_score": final_score,
+                "ai_answers": stored
+            })
+
+            write_audit(candidate_id, "EVALUATOR", "interview_completed", {"final_score": final_score})
+
+            # Resume pipeline in background
+            from agents.orchestrator.agent import resume_pipeline_after_interview
+            import threading
+            def resume():
+                try:
+                    resume_pipeline_after_interview(candidate_id, final_score)
+                except Exception as e:
+                    print(f"[API] Resume pipeline error: {e}")
+
+            thread = threading.Thread(target=resume)
+            thread.daemon = True
+            thread.start()
+
+            print(f"[API] Interview complete for {candidate_id}. Final score: {final_score}")
+            return {"success": True, "message": "Interview complete. Pipeline resumed.", "final_score": final_score}
+
+        except Exception as e:
+            print(f"[API] Error processing complete_ai_interview for {candidate_id}: {e}")
+            return {"success": False, "message": str(e)}
     except Exception as e:
-        return {"success": True, "message": "Interview recorded."}    
+        return {"success": False, "message": "Interview recorded with error."}
 # ── Run Server ───────────────────────────────────────────────────
 if __name__ == "__main__":
     uvicorn.run(

@@ -14,6 +14,8 @@ export default function InterviewPage({
   resumeCount = 0,
   currentRound = 1,
 }) {
+  // Debug: verify candidateId is passed
+  console.log('[ARIA] InterviewPage received candidateId:', candidateId);
   const [phase, setPhase]     = useState('intro');
   const [answers, setAnswers] = useState([]);
   const [score, setScore]     = useState(null);
@@ -79,6 +81,7 @@ export default function InterviewPage({
             roundsTotal={roundsTotal}
             candidateName={candidateName}
             roleName={roleName}
+            candidateId={candidateId}
             onComplete={handleComplete}
           />
         )}

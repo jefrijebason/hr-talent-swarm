@@ -407,7 +407,7 @@ Return ONLY valid JSON:
         return False
 
 def handle_acceptance(assignment_id: str) -> bool:
-    """Interviewer accepted. Schedule meeting. Notify candidate."""
+    """Interviewer accepted. Schedule meeting. Notify both parties."""
     assignment     = get_assignment(assignment_id)
     candidate      = get_candidate(assignment["candidate_id"])
     interviewer_id = assignment.get("assigned_to", "")
@@ -420,13 +420,21 @@ def handle_acceptance(assignment_id: str) -> bool:
         interviewer_name  = iv["name"] if iv else "Interviewer"
         interviewer_email = iv["email"] if iv else ""
 
+    # Schedule meeting — send emails to BOTH candidate AND interviewer
     from agents.scheduler.agent import run_scheduler
     try:
-        slot = run_scheduler(assignment["candidate_id"], assignment["interview_type"])
+        slot = run_scheduler(
+            assignment["candidate_id"],
+            assignment["interview_type"],
+            send_candidate_email=True,
+            interviewer_email=interviewer_email,
+            interviewer_name=interviewer_name
+        )
         meeting_url = slot.get("meeting_url", "")
         slot_human  = slot.get("slot_human", "")
-    except Exception:
-        meeting_url = "https://teams.microsoft.com/demo"
+    except Exception as e:
+        print(f"[PIS] Scheduler error: {e}")
+        meeting_url = ""
         slot_human  = "To be confirmed"
 
     update_assignment(assignment_id, {
@@ -441,11 +449,8 @@ def handle_acceptance(assignment_id: str) -> bool:
         f"{interviewer_name} accepted the interview"
     )
 
-    _send_candidate_confirmation(
-        assignment["candidate_id"], interviewer_name,
-        slot_human, meeting_url,
-        candidate.get("applied_role", "")
-    )
+    # Do NOT call _send_candidate_confirmation here
+    # run_scheduler already sent emails to both parties
 
     if not interviewer_id.startswith("custom_"):
         iv = get_interviewer(interviewer_id)

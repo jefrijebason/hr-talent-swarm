@@ -1,4 +1,4 @@
-import React, { useState, useRef } from 'react';
+import React, { useState, useEffect, useRef } from 'react';
 import Editor from '@monaco-editor/react';
 import axios from 'axios';
 
@@ -56,10 +56,15 @@ export default function App() {
   const [submitted, setSubmitted]   = useState(false);
   const [timeLeft, setTimeLeft]     = useState(30 * 60);
   const [testResults, setTestResults] = useState([]);
+  const [problem, setProblem]       = useState(DEMO_PROBLEM);
+  const [loadingProblem, setLoadingProblem] = useState(false);
+  const [problemError, setProblemError] = useState('');
   const [phase, setPhase]           = useState('coding');
   const [interrogation, setInterrogation] = useState([]);
   const [answers, setAnswers]       = useState({});
   const [finalScore, setFinalScore] = useState(null);
+  const [candidateId, setCandidateId] = useState('');
+  const [jobId, setJobId] = useState('');
   const timerRef                    = useRef(null);
 
   // Start timer on first keystroke
@@ -88,95 +93,111 @@ export default function App() {
     setCode(STARTER_CODE[lang]);
   };
 
+  useEffect(() => {
+    const params = new URLSearchParams(window.location.search);
+    setCandidateId(params.get('candidate') || '');
+    setJobId(params.get('job') || '');
+  }, []);
+
+  const fetchCodingProblem = async (cid) => {
+    if (!cid) return;
+    setLoadingProblem(true);
+    setProblemError('');
+
+    try {
+      const res = await axios.get(`${API_URL}/api/coding-problem`, {
+        params: { candidate_id: cid }
+      });
+      const payload = res.data?.problem || res.data;
+      if (payload && payload.problem_title) {
+        setProblem(payload);
+        if (payload.starter_code && code === STARTER_CODE[language]) {
+          setCode(payload.starter_code.replace(/\r\n/g, '\n'));
+        }
+      } else {
+        setProblem(DEMO_PROBLEM);
+      }
+    } catch (err) {
+      setProblemError('Unable to load your coding problem. Using default task.');
+      setProblem(DEMO_PROBLEM);
+    }
+    setLoadingProblem(false);
+  };
+
+  useEffect(() => {
+    if (candidateId) {
+      fetchCodingProblem(candidateId);
+    }
+  }, [candidateId]);
+
   const handleRun = async () => {
     startTimer();
     setRunning(true);
     setOutput('Running your code...');
+    setTestResults([]);
 
     try {
+      const sampleInput = problem?.test_cases?.find(tc => !tc.is_hidden)?.input ||
+        problem?.test_cases?.[0]?.input || '1\n2';
       const res = await axios.post(`${API_URL}/api/run-code`, {
-        code, language, input: '[85, 92, 78, 95, 88]\n3'
+        code,
+        language,
+        input: sampleInput
       });
-      setOutput(res.data.output || res.data.stdout || 'No output');
-
-      // Demo test results
-      setTestResults([
-        { id: 1, type: 'Basic', passed: true,
-          input: '[85,92,78,95,88], k=3',
-          expected: '[(95,100.0),(92,80.0),(88,60.0)]' },
-      ]);
-
-    } catch {
-      // Demo mode
-      setOutput('Output: [(95, 100.0), (92, 80.0), (88, 60.0)]\n\n✅ Test case 1 passed');
-      setTestResults([
-        { id: 1, type: 'Basic', passed: true,
-          input: '[85,92,78,95,88], k=3',
-          expected: '[(95,100.0),(92,80.0),(88,60.0)]' },
-      ]);
+      setOutput(res.data.output || res.data.stdout || res.data.error || 'No output');
+    } catch (err) {
+      setOutput('Unable to run code at the moment. Please try again.');
     }
     setRunning(false);
   };
 
   const handleSubmit = async () => {
+    if (!candidateId) {
+      setOutput('Candidate ID missing from the URL. Please open the coding assessment from your email link.');
+      return;
+    }
+
     clearInterval(timerRef.current);
     setRunning(true);
-    setOutput('Submitting and running all test cases...');
+    setOutput('Submitting your solution...');
+    setTestResults([]);
 
-    await new Promise(r => setTimeout(r, 2000));
+    try {
+      const form = new FormData();
+      form.append('candidate_id', candidateId);
+      form.append('code', code);
+      form.append('language', language);
 
-    setTestResults([
-      { id: 1, type: 'Basic',       passed: true  },
-      { id: 2, type: 'Edge Case',   passed: true  },
-      { id: 3, type: 'Performance', passed: false },
-    ]);
+      const res = await axios.post(`${API_URL}/api/submit-code`, form);
+      const responseData = res.data || {};
 
-    setOutput('2/3 test cases passed\n\nBasic: ✅\nEdge Case: ✅\nPerformance: ❌ (Time limit exceeded)');
-    setSubmitted(true);
-    setRunning(false);
-
-    // Move to anti-malpractice phase
-    setTimeout(() => {
+      setTestResults(responseData.test_results?.results || []);
+      setInterrogation(responseData.questions || []);
+      setFinalScore(responseData.coding_score ?? finalScore);
+      setOutput(responseData.output || `Your code was submitted successfully.`);
+      setSubmitted(true);
       setPhase('interrogation');
-      setInterrogation([
-        {
-          id: 1,
-          question: 'You sorted the entire array first before slicing to get top k. What is the time complexity of your approach?',
-          hint: 'Think about O(n log n) vs O(n log k)'
-        },
-        {
-          id: 2,
-          question: 'On the percentile calculation — why did you use (lower / total) × 100 rather than (rank / total) × 100?',
-          hint: 'Consider what percentile actually means'
-        },
-        {
-          id: 3,
-          question: 'Your solution fails the performance test case. How would you optimize it for 10,000 candidates?',
-          hint: 'Think about heap data structure'
-        },
-        {
-          id: 4,
-          question: 'Show me a completely different approach to find top k elements without sorting the full array.',
-          hint: 'Python has a heapq module'
-        },
-        {
-          id: 5,
-          question: 'If this ran in production processing 1 million candidates daily — what would break first?',
-          hint: 'Think about memory and latency'
-        },
-      ]);
-    }, 1500);
+    } catch (err) {
+      setOutput('Submission failed. Please try again later.');
+      setSubmitted(false);
+    }
+
+    setRunning(false);
   };
 
   const handleAnswerSubmit = async () => {
     setRunning(true);
+    setOutput('Submitting your answers for review...');
+    setFinalScore(null);
+
     await new Promise(r => setTimeout(r, 2000));
 
-    const score = Math.floor(Math.random() * 20) + 75;
-    setFinalScore(score);
     setPhase('complete');
+    setOutput('Your answers have been submitted. A reviewer will evaluate them and email next steps.');
     setRunning(false);
   };
+
+  const currentProblem = problem || DEMO_PROBLEM;
 
   // ── COMPLETE PHASE ───────────────────────────────────────────
   if (phase === 'complete') {
@@ -186,27 +207,13 @@ export default function App() {
           <div style={st.completeIcon}>🎉</div>
           <h1 style={st.completeTitle}>Coding Round Complete!</h1>
           <div style={st.scoreCircle}>
-            <div style={st.scoreNum}>{finalScore}</div>
+            <div style={st.scoreNum}>{finalScore || 'TBD'}</div>
             <div style={st.scoreLabel}>/ 100</div>
           </div>
           <p style={st.completeMsg}>
-            Your submission has been evaluated. You will receive
-            an email with your next steps within 30 minutes.
+            Your answers have been submitted and are now under review.
+            We will email you the final result and next steps as soon as evaluation completes.
           </p>
-          <div style={st.breakdown}>
-            <div style={st.breakRow}>
-              <span>Test Cases</span>
-              <span style={{color: '#16a34a'}}>2/3 Passed</span>
-            </div>
-            <div style={st.breakRow}>
-              <span>Code Quality</span>
-              <span style={{color: '#1d4ed8'}}>Good</span>
-            </div>
-            <div style={st.breakRow}>
-              <span>Understanding</span>
-              <span style={{color: '#7c3aed'}}>Strong</span>
-            </div>
-          </div>
         </div>
       </div>
     );
@@ -277,7 +284,7 @@ export default function App() {
         <div style={st.headerLeft}>
           <span style={st.logo}>💻</span>
           <span style={st.headerTitle}>Coding Assessment</span>
-          <span style={st.problemTitle}>{DEMO_PROBLEM.title}</span>
+          <span style={st.problemTitle}>{currentProblem.problem_title || currentProblem.title}</span>
         </div>
         <div style={st.headerRight}>
           <div style={{
@@ -305,46 +312,54 @@ export default function App() {
 
         {/* Problem Panel */}
         <div style={st.problemPanel}>
-          <h3 style={st.sectionTitle}>{DEMO_PROBLEM.title}</h3>
-          <p style={st.description}>{DEMO_PROBLEM.description}</p>
+          <h3 style={st.sectionTitle}>{currentProblem.problem_title || currentProblem.title}</h3>
+          <p style={st.description}>{currentProblem.problem_description || currentProblem.description}</p>
+
+          {problemError && (
+            <div style={{ color: '#f97316', marginBottom: '16px' }}>
+              {problemError}
+            </div>
+          )}
 
           <div style={st.exampleBox}>
             <div style={st.exampleTitle}>Example</div>
             <div style={st.exampleItem}>
               <span style={st.exampleLabel}>Input:</span>
               <code style={st.exampleCode}>
-                {DEMO_PROBLEM.example.input}
+                {currentProblem.example?.input || 'N/A'}
               </code>
             </div>
             <div style={st.exampleItem}>
               <span style={st.exampleLabel}>Output:</span>
               <code style={st.exampleCode}>
-                {DEMO_PROBLEM.example.output}
+                {currentProblem.example?.output || 'N/A'}
               </code>
             </div>
             <div style={st.exampleItem}>
               <span style={st.exampleLabel}>Explanation:</span>
               <span style={{fontSize: '13px', color: '#475569'}}>
-                {DEMO_PROBLEM.example.explanation}
+                {currentProblem.example?.explanation || 'Use the problem statement to guide your solution.'}
               </span>
             </div>
           </div>
 
-          <div style={st.constraints}>
-            <div style={st.constraintsTitle}>Constraints</div>
-            {DEMO_PROBLEM.constraints.map((c, i) => (
-              <div key={i} style={st.constraintItem}>
-                • {c}
-              </div>
-            ))}
-          </div>
+          {currentProblem.constraints?.length > 0 && (
+            <div style={st.constraints}>
+              <div style={st.constraintsTitle}>Constraints</div>
+              {currentProblem.constraints.map((c, i) => (
+                <div key={i} style={st.constraintItem}>
+                  • {c}
+                </div>
+              ))}
+            </div>
+          )}
 
           {/* Test Results */}
           {testResults.length > 0 && (
             <div style={st.testResults}>
               <div style={st.constraintsTitle}>Test Results</div>
               {testResults.map(tc => (
-                <div key={tc.id} style={{
+                <div key={tc.test_case_id || tc.id} style={{
                   ...st.testRow,
                   borderLeft: `3px solid ${tc.passed ? '#16a34a' : '#dc2626'}`
                 }}>
@@ -355,7 +370,7 @@ export default function App() {
                     {tc.passed ? '✅' : '❌'}
                   </span>
                   <span style={{fontSize: '13px', color: '#475569'}}>
-                    {tc.type} Test Case
+                    {(tc.type || 'Test').charAt(0).toUpperCase() + (tc.type || 'Test').slice(1)} Test Case
                   </span>
                 </div>
               ))}

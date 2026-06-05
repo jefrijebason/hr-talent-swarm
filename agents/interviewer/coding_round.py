@@ -288,7 +288,8 @@ def run_coding_round(candidate_id: str,
                       coding_type: str,
                       seniority: str,
                       submitted_code: str = None,
-                      language: str = "python") -> dict:
+                      language: str = "python",
+                      problem: dict = None) -> dict:
     """
     Run complete coding round:
     1. Generate problem
@@ -300,10 +301,13 @@ def run_coding_round(candidate_id: str,
     """
     print(f"[CODING] Starting coding round for: {candidate_id}")
 
-    # Step 1 — Generate problem
-    problem = generate_coding_problem(
-        jd_text, tech_stack, coding_type, seniority
-    )
+    # Step 1 — Use existing problem or generate a new one
+    if problem is None:
+        problem = generate_coding_problem(
+            jd_text, tech_stack, coding_type, seniority
+        )
+    else:
+        print(f"[CODING] Using stored problem for candidate: {candidate_id}")
 
     # Step 2 — Get or simulate code
     if submitted_code:

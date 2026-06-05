@@ -3,11 +3,14 @@ import { motion, AnimatePresence } from 'framer-motion';
 import AIIndicator from './AIOrb';
 import { iTheme } from './interviewTheme';
 
+const API_URL = process.env.REACT_APP_API_URL || 'http://localhost:8000';
+
 export default function InterviewChat({
   roundsTotal = 3,
   onComplete,
   candidateName = 'there',
   roleName = 'Senior AI Engineer',
+  candidateId = '',
 }) {
   const [messages, setMessages]     = useState([]);
   const [input, setInput]           = useState('');
@@ -107,6 +110,26 @@ export default function InterviewChat({
       answer,
     }];
     setAllAnswers(updatedAnswers);
+
+    // Evaluate answer on backend in real-time
+    (async () => {
+      try {
+        const fd = new FormData();
+        fd.append('candidate_id', candidateId);
+        fd.append('question', activeQuestions[currentRound - 1].question);
+        fd.append('answer', answer);
+        fd.append('round_num', currentRound.toString());
+        
+        const evalResponse = await fetch(`${API_URL}/api/ai-interview/evaluate-answer`, {
+          method: 'POST',
+          body: fd
+        });
+        const evalData = await evalResponse.json();
+        console.log(`[ARIA] Round ${currentRound} evaluated:`, evalData);
+      } catch (e) {
+        console.log('[ARIA] Evaluation error (non-blocking):', e);
+      }
+    })();
 
     // Check if this was the follow-up answer (even answer in round)
     const messagesInRound = messages.filter(m => m.role === 'user').length + 1;

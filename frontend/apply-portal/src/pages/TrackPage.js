@@ -51,6 +51,12 @@ function buildStages(candidate, job) {
                    'ai_interview_in_progress', 'ai_interview_complete']
       });
     }
+    if (job?.coding_round_enabled || ['coding_sent', 'coding_complete'].includes(status)) {
+      stages.push({
+        key: 'coding', label: 'Coding Assessment', icon: '💻',
+        statuses: ['coding_sent', 'coding_complete']
+      });
+    }
     stages.push({
       key: 'combined_interview', label: 'Combined Interview', icon: '👤',
       statuses: ['waiting_technical_interview', 'waiting_hr_interview']
@@ -64,7 +70,7 @@ function buildStages(candidate, job) {
                    'ai_interview_in_progress', 'ai_interview_complete']
       });
     }
-    if (job?.coding_round_enabled) {
+    if (job?.coding_round_enabled || ['coding_sent', 'coding_complete'].includes(status)) {
       stages.push({
         key: 'coding', label: 'Coding Assessment', icon: '💻',
         statuses: ['coding_sent', 'coding_complete']
@@ -101,7 +107,7 @@ function buildStages(candidate, job) {
                    'ai_interview_in_progress', 'ai_interview_complete']
       });
     }
-    if (job?.coding_round_enabled) {
+    if (job?.coding_round_enabled || ['coding_sent', 'coding_complete'].includes(status)) {
       stages.push({
         key: 'coding', label: 'Coding Assessment', icon: '💻',
         statuses: ['coding_sent', 'coding_complete']
@@ -130,8 +136,8 @@ function buildStages(candidate, job) {
 function getCurrentStageIndex(stages, status) {
   if (!status) return 0;
 
-  // Special: rejected or hired → last stage
-  if (status === 'hired' || status === 'rejected') {
+  // Special: hired goes to final stage
+  if (status === 'hired') {
     return stages.length - 1;
   }
 
@@ -145,6 +151,36 @@ function getCurrentStageIndex(stages, status) {
       status.includes(s) || s.includes(status))) return i;
   }
 
+  return 0;
+}
+
+function getRejectedStageIndex(stages, candidate, job) {
+  if (!candidate || candidate.status !== 'rejected') return stages.length - 1;
+
+  // If the pipeline actually reached the final decision, keep the full stage timeline.
+  if (candidate.final_score !== undefined) {
+    return stages.length - 1;
+  }
+
+  // If the candidate has reached AI evaluation, assume rejection occurred there.
+  if (candidate.ai_interview_score !== undefined) {
+    const idx = stages.findIndex(s => s.key === 'ai_interview');
+    return idx >= 0 ? idx : 1;
+  }
+
+  // If the candidate completed coding before rejection, stop at coding.
+  if (candidate.coding_score !== undefined) {
+    const idx = stages.findIndex(s => s.key === 'coding');
+    return idx >= 0 ? idx : 1;
+  }
+
+  // If the candidate has only resume data, reject at screening.
+  if (candidate.resume_score !== undefined) {
+    const idx = stages.findIndex(s => s.key === 'screened');
+    return idx >= 0 ? idx : 1;
+  }
+
+  // Fallback to the applied stage if no other evidence exists.
   return 0;
 }
 
@@ -254,19 +290,22 @@ export default function TrackPage({ initialQuery = '' }) {
   const handleTrack = () => doTrack(query);
   const handleKeyDown = (e) => { if (e.key === 'Enter') handleTrack(); };
 
-  const stages      = candidate ? buildStages(candidate, job) : [];
-  const stageIdx    = candidate ? getCurrentStageIndex(stages, candidate.status) : 0;
-  const isRejected  = candidate?.status === 'rejected';
-  const isHired     = candidate?.status === 'hired';
-  const isComplete  = isRejected || isHired;
+  const stages       = candidate ? buildStages(candidate, job) : [];
+  const stageIdx     = candidate ? getCurrentStageIndex(stages, candidate.status) : 0;
+  const isRejected   = candidate?.status === 'rejected';
+  const isHired      = candidate?.status === 'hired';
+  const isComplete   = isRejected || isHired;
+  const rejectedIdx  = isRejected ? getRejectedStageIndex(stages, candidate, job) : stageIdx;
 
-  // Only show stages up to current + 1 (or all completed + next)
+  // Only show stages up to the current stage, and if still active show the next upcoming stage.
   const visibleStages = stages.filter((_, i) => {
+    if (isRejected) {
+      // Hide all stages beyond the rejection point.
+      return i <= rejectedIdx;
+    }
     if (isComplete) {
-      // Show all stages up to and including the final one
       return i <= stageIdx;
     }
-    // Show completed + current + next one
     return i <= stageIdx + 1;
   });
 
@@ -403,7 +442,7 @@ export default function TrackPage({ initialQuery = '' }) {
                 <motion.div
                   initial={{ height: 0 }}
                   animate={{
-                    height: `${(Math.min(stageIdx, visibleStages.length - 1) /
+                    height: `${(Math.min(isRejected ? rejectedIdx : stageIdx, visibleStages.length - 1) /
                       Math.max(visibleStages.length - 1, 1)) * 100}%`
                   }}
                   transition={{ duration: 1, ease: 'easeOut' }}
@@ -417,9 +456,9 @@ export default function TrackPage({ initialQuery = '' }) {
 
               {visibleStages.map((stage, i) => {
                 const realIdx = stages.indexOf(stage);
-                const done    = realIdx < stageIdx;
-                const current = realIdx === stageIdx;
-                const next    = realIdx > stageIdx;
+                const done    = realIdx < (isRejected ? rejectedIdx : stageIdx);
+                const current = realIdx === (isRejected ? rejectedIdx : stageIdx);
+                const next    = realIdx > (isRejected ? rejectedIdx : stageIdx);
                 const isRejectedHere = isRejected && current;
 
                 return (
