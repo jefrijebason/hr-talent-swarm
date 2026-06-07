@@ -355,17 +355,24 @@ def _send_interviewer_invite(candidate: dict,
     if interview_type == "hr":
             decision_url = f"http://localhost:8000/hr/decision/{candidate.get('id','')}"
             meeting_section += f"""
-    <div style="margin-top:16px;padding:16px;background:#f8fafc;
-    border-radius:10px;border:1px solid #e2e8f0">
-    <p style="font-weight:700;color:#374151;margin:0 0 8px">
-        After the HR interview:
+    <div style="margin-top:20px;padding:20px;background:#f8fafc;
+    border-radius:12px;border:1px solid #e2e8f0">
+    <p style="font-weight:700;color:#0f172a;margin:0 0 6px;font-size:15px">
+        After the HR Interview
+    </p>
+    <p style="color:#64748b;font-size:13px;margin:0 0 14px">
+        Once the interview is complete, use this form to send an offer,
+        decline, or add the candidate to the talent pool.
     </p>
     <a href="{decision_url}"
-        style="display:inline-block;background:#6366f1;color:#fff;
-        padding:12px 28px;text-decoration:none;border-radius:8px;
-        font-weight:bold">
-        📋 Submit Decision (Offer / Decline / Talent Pool) →
+        style="display:inline-block;background:linear-gradient(135deg,#6366f1,#7c3aed);
+        color:#fff;padding:14px 28px;text-decoration:none;border-radius:8px;
+        font-weight:700;font-size:14px">
+        📋 Open Decision Form →
     </a>
+    <p style="color:#94a3b8;font-size:11px;margin:10px 0 0">
+        Options: Send Offer Letter · Decline · Add to Talent Pool
+    </p>
     </div>"""
 
     focus_html = "".join(f"<li>{f}</li>" for f in focus_on[:5]) if focus_on else "<li>Technical depth and culture fit</li>"

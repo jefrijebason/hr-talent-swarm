@@ -1149,10 +1149,7 @@ def _scoring_html(assignment_id, name, role, candidate):
         <option value="strong_no_hire">Strong No Hire</option>
       </select>
     </div>
-    <div style="margin-bottom:24px">
-      <label style="display:block;font-weight:600;margin-bottom:6px;color:#374151">Suggested Salary (LPA)</label>
-      <input name="suggested_salary" placeholder="e.g. 22" style="width:100%;padding:10px;border:1px solid #e2e8f0;border-radius:8px;box-sizing:border-box">
-    </div>
+
 
     <button type="submit" style="width:100%;padding:14px;background:linear-gradient(135deg,#6366f1,#7c3aed);color:#fff;border:none;border-radius:10px;font-size:16px;font-weight:700;cursor:pointer">
       Submit Evaluation
@@ -1195,7 +1192,7 @@ class ScoreSubmission(BaseModel):
     strengths: str = ""
     concerns: str = ""
     recommendation: str = "maybe"
-    suggested_salary: str = ""
+    
 
 
 @app.post("/api/interview/submit-score")
@@ -1300,12 +1297,7 @@ def _email_combined_report(candidate, candidate_id, human_score, ai_combined,
 <a href="{approve_url}" style="display:inline-block;background:#16a34a;color:#fff;
 padding:12px 28px;text-decoration:none;border-radius:8px;font-weight:bold;margin-right:10px">
 ✓ Approve & Schedule HR Round</a>
-<a href="{decision_url}" style="display:inline-block;
-  background:#6366f1;color:#fff;padding:12px 28px;
-  text-decoration:none;border-radius:8px;font-weight:bold;
-  margin-top:10px">
-  📋 Open Decision Form (Offer / Decline / Talent Pool)
-</a>
+
 <a href="{reject_url}" style="display:inline-block;background:#dc2626;color:#fff;
 padding:12px 28px;text-decoration:none;border-radius:8px;font-weight:bold">
 ✗ Reject</a>

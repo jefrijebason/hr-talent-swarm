@@ -1,4 +1,5 @@
 from agents.scheduler.agent import run_scheduler
+from shared.agent_feed import log_agent
 from shared.cosmos_client import (
     get_assignment, update_assignment,
     get_interviewer, get_candidate,
@@ -61,6 +62,8 @@ def create_assignment(candidate_id: str,
 
     save_assignment(assignment)
     print(f"[PIS] Assignment created: {assignment['id']}")
+    log_agent("INTERVIEWER_POOL", "assignment_created",
+              f"Primary: {primary.get('name','None') if primary else 'None'}", candidate_id)
     return assignment
 
 def send_interview_request(assignment_id: str) -> bool:
@@ -145,6 +148,8 @@ Return ONLY valid JSON:
                 "status":      "invited",
                 "assigned_at": datetime.utcnow().isoformat()
             })
+            log_agent("INTERVIEWER_POOL", "accepted",
+              f"{interviewer_name} accepted the interview", assignment["candidate_id"])
             add_assignment_timeline(
                 assignment_id, "invitation_sent",
                 f"Email sent to {interviewer['name']} ({interviewer['email']})"
@@ -187,6 +192,8 @@ def check_and_escalate(assignment_id: str) -> dict:
         return _escalate_to_backup2(assignment_id, assignment)
     elif level == 2:
         return _alert_hr(assignment_id, assignment)
+        log_agent("INTERVIEWER_POOL", "hr_alerted",
+              f"All interviewers unavailable — HR alerted", assignment["candidate_id"])
     else:
         return {"status": "max_escalation_reached"}
 
