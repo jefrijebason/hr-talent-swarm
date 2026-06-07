@@ -182,7 +182,8 @@ def run_scheduler(candidate_id: str,
                   interview_type: str = "technical",
                   send_candidate_email: bool = True,
                   interviewer_email: str = "",
-                  interviewer_name: str = "") -> dict:
+                  interviewer_name: str = "",
+                  assignment_id: str = "") -> dict:
     """
     Main scheduler: books Teams meeting.
     send_candidate_email=False when called from escalation (it sends its own).
@@ -256,7 +257,7 @@ def run_scheduler(candidate_id: str,
     if interviewer_email:
         _send_interviewer_invite(
             candidate, interviewer_name, interviewer_email,
-            slot_str, meeting_url, interview_type
+            slot_str, meeting_url, interview_type, assignment_id
         )
 
     print(f"[SCHEDULER] Interview scheduled: {slot_str}")
@@ -327,7 +328,8 @@ def _send_interviewer_invite(candidate: dict,
                               interviewer_email: str,
                               slot_str: str,
                               meeting_url: str,
-                              interview_type: str):
+                              interview_type: str,
+                              assignment_id: str = ""):
     """Send interview details + candidate AI briefing to INTERVIEWER."""
     from agents.communicator.agent import send_email
 
@@ -397,8 +399,12 @@ def _send_interviewer_invite(candidate: dict,
 
 {"<p><strong>Suggested questions:</strong></p><ul>" + questions_html + "</ul>" if questions_html else ""}
 
-<p>After the interview, submit your feedback on the
-<a href="http://localhost:3000">HR Dashboard</a>.</p>
+<p style="margin-top:24px"><strong>After the interview, submit your evaluation:</strong></p>
+<a href="http://localhost:8000/interview/score/{assignment_id}"
+   style="display:inline-block;background:#6366f1;color:#fff;padding:12px 28px;
+   text-decoration:none;border-radius:8px;font-weight:bold">
+   Submit Your Evaluation →
+</a>
 
 <p>Thank you,<br>HR Team</p>
 """)

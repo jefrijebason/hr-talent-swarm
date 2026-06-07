@@ -1,3 +1,4 @@
+from agents.scheduler.agent import run_scheduler
 from shared.cosmos_client import (
     get_assignment, update_assignment,
     get_interviewer, get_candidate,
@@ -428,7 +429,8 @@ def handle_acceptance(assignment_id: str) -> bool:
             assignment["interview_type"],
             send_candidate_email=True,
             interviewer_email=interviewer_email,
-            interviewer_name=interviewer_name
+            interviewer_name=interviewer_name,
+            assignment_id=assignment_id
         )
         meeting_url = slot.get("meeting_url", "")
         slot_human  = slot.get("slot_human", "")
@@ -460,7 +462,7 @@ def handle_acceptance(assignment_id: str) -> bool:
             })
 
     print(f"[PIS] Accepted by {interviewer_name}. Meeting: {slot_human}")
-    return True
+    return True*
 
 def _notify_skipped_interviewer(assignment: dict, level: int):
     """Politely notify interviewer they were skipped."""

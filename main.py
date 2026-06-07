@@ -1058,6 +1058,309 @@ from shared.agent_feed import get_feed, log_agent
 def agent_feed(limit: int = 50):
     return get_feed(limit)
 
+from fastapi.responses import HTMLResponse
+from pydantic import BaseModel
+
+# ── Interviewer Scoring ──────────────────────────────────────────
+
+@app.get("/interview/score/{assignment_id}", response_class=HTMLResponse)
+def scoring_page(assignment_id: str):
+    """Serve the interviewer scoring form."""
+    from shared.cosmos_client import get_assignment, get_candidate
+    assignment = get_assignment(assignment_id)
+    if not assignment:
+        return HTMLResponse("<h2>Assignment not found</h2>", status_code=404)
+
+    candidate = get_candidate(assignment.get("candidate_id", ""))
+    cand_name = candidate.get("name", "Candidate") if candidate else "Candidate"
+    role = candidate.get("applied_role", "") if candidate else ""
+
+    if assignment.get("feedback_submitted"):
+        return HTMLResponse(f"""
+        <div style="font-family:Segoe UI,sans-serif;max-width:600px;margin:80px auto;text-align:center">
+          <div style="font-size:48px">✅</div>
+          <h2>Feedback Already Submitted</h2>
+          <p style="color:#64748b">Thank you for evaluating {cand_name}. Your feedback has been recorded.</p>
+        </div>""")
+
+    return HTMLResponse(_scoring_html(assignment_id, cand_name, role, candidate))
+
+
+def _scoring_html(assignment_id, name, role, candidate):
+    ai_score = candidate.get("ai_interview_score", "N/A") if candidate else "N/A"
+    resume_score = candidate.get("resume_score", "N/A") if candidate else "N/A"
+    coding_score = candidate.get("coding_score", "N/A") if candidate else "N/A"
+
+    def score_row(label, field):
+        opts = "".join(f'<option value="{i}">{i}</option>' for i in range(1, 11))
+        return f"""
+        <div style="margin-bottom:16px">
+          <label style="display:block;font-weight:600;margin-bottom:6px;color:#374151">{label}</label>
+          <select name="{field}" required style="width:100%;padding:10px;border:1px solid #e2e8f0;border-radius:8px;font-size:14px">
+            <option value="">Select score (1-10)</option>{opts}
+          </select>
+        </div>"""
+
+    return f"""
+<!DOCTYPE html><html><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Interview Scorecard — {name}</title></head>
+<body style="font-family:Segoe UI,sans-serif;background:#f1f5f9;margin:0;padding:24px">
+<div style="max-width:680px;margin:0 auto;background:#fff;border-radius:16px;padding:32px;box-shadow:0 4px 20px rgba(0,0,0,0.08)">
+  <h1 style="color:#0f172a;margin:0 0 4px">Interview Scorecard</h1>
+  <p style="color:#64748b;margin:0 0 8px">Candidate: <strong>{name}</strong> — {role}</p>
+  <div style="background:#eff6ff;border-radius:10px;padding:12px;margin-bottom:24px;font-size:13px;color:#1e40af">
+    AI Pre-Screening → Resume: {resume_score}/100 · AI Interview: {ai_score}/100 · Coding: {coding_score}/100<br>
+    <em>Focus your scoring on areas the AI could not assess.</em>
+  </div>
+
+  <form id="f" onsubmit="submitForm(event)">
+    <h3 style="color:#6366f1;border-bottom:2px solid #eff6ff;padding-bottom:6px">Technical Assessment</h3>
+    {score_row("Technical Depth", "tech_depth")}
+    {score_row("Problem Solving", "problem_solving")}
+    {score_row("System Design", "system_design")}
+
+    <h3 style="color:#6366f1;border-bottom:2px solid #eff6ff;padding-bottom:6px">Soft Skills</h3>
+    {score_row("Communication", "communication")}
+    {score_row("Collaboration", "collaboration")}
+
+    <h3 style="color:#6366f1;border-bottom:2px solid #eff6ff;padding-bottom:6px">Cultural Fit</h3>
+    {score_row("Values Alignment", "culture_fit")}
+    {score_row("Growth Mindset", "growth_mindset")}
+
+    <h3 style="color:#6366f1;border-bottom:2px solid #eff6ff;padding-bottom:6px">Feedback</h3>
+    <div style="margin-bottom:16px">
+      <label style="display:block;font-weight:600;margin-bottom:6px;color:#374151">Key Strengths</label>
+      <textarea name="strengths" rows="3" style="width:100%;padding:10px;border:1px solid #e2e8f0;border-radius:8px;box-sizing:border-box"></textarea>
+    </div>
+    <div style="margin-bottom:16px">
+      <label style="display:block;font-weight:600;margin-bottom:6px;color:#374151">Areas of Concern</label>
+      <textarea name="concerns" rows="3" style="width:100%;padding:10px;border:1px solid #e2e8f0;border-radius:8px;box-sizing:border-box"></textarea>
+    </div>
+
+    <h3 style="color:#6366f1;border-bottom:2px solid #eff6ff;padding-bottom:6px">Recommendation</h3>
+    <div style="margin-bottom:16px">
+      <select name="recommendation" required style="width:100%;padding:10px;border:1px solid #e2e8f0;border-radius:8px;font-size:14px">
+        <option value="">Select recommendation</option>
+        <option value="strong_hire">Strong Hire</option>
+        <option value="hire">Hire</option>
+        <option value="maybe">Maybe</option>
+        <option value="no_hire">No Hire</option>
+        <option value="strong_no_hire">Strong No Hire</option>
+      </select>
+    </div>
+    <div style="margin-bottom:24px">
+      <label style="display:block;font-weight:600;margin-bottom:6px;color:#374151">Suggested Salary (LPA)</label>
+      <input name="suggested_salary" placeholder="e.g. 22" style="width:100%;padding:10px;border:1px solid #e2e8f0;border-radius:8px;box-sizing:border-box">
+    </div>
+
+    <button type="submit" style="width:100%;padding:14px;background:linear-gradient(135deg,#6366f1,#7c3aed);color:#fff;border:none;border-radius:10px;font-size:16px;font-weight:700;cursor:pointer">
+      Submit Evaluation
+    </button>
+  </form>
+  <div id="msg" style="display:none;text-align:center;padding:40px">
+    <div style="font-size:48px">✅</div>
+    <h2 style="color:#16a34a">Evaluation Submitted!</h2>
+    <p style="color:#64748b">Thank you. The hiring manager has been notified.</p>
+  </div>
+</div>
+<script>
+async function submitForm(e) {{
+  e.preventDefault();
+  const form = document.getElementById('f');
+  const data = {{ assignment_id: "{assignment_id}" }};
+  new FormData(form).forEach((v,k) => data[k] = v);
+  try {{
+    const r = await fetch('/api/interview/submit-score', {{
+      method: 'POST', headers: {{'Content-Type':'application/json'}},
+      body: JSON.stringify(data)
+    }});
+    if (r.ok) {{ form.style.display='none'; document.getElementById('msg').style.display='block'; }}
+    else {{ alert('Submission failed. Please try again.'); }}
+  }} catch {{ alert('Network error. Please try again.'); }}
+}}
+</script>
+</body></html>"""
+
+
+class ScoreSubmission(BaseModel):
+    assignment_id: str
+    tech_depth: int = 5
+    problem_solving: int = 5
+    system_design: int = 5
+    communication: int = 5
+    collaboration: int = 5
+    culture_fit: int = 5
+    growth_mindset: int = 5
+    strengths: str = ""
+    concerns: str = ""
+    recommendation: str = "maybe"
+    suggested_salary: str = ""
+
+
+@app.post("/api/interview/submit-score")
+def submit_score(sub: ScoreSubmission):
+    """Receive interviewer scores, generate combined report, email HR."""
+    from shared.cosmos_client import (get_assignment, update_assignment,
+        get_candidate, update_candidate, get_job, get_hr_user)
+    from agents.communicator.agent import send_email
+    from shared.agent_feed import log_agent
+
+    assignment = get_assignment(sub.assignment_id)
+    if not assignment:
+        raise HTTPException(status_code=404, detail="Assignment not found")
+
+    candidate_id = assignment.get("candidate_id", "")
+    candidate = get_candidate(candidate_id)
+    if not candidate:
+        raise HTTPException(status_code=404, detail="Candidate not found")
+
+    # Compute human score (average of all dims × 10 → 0-100 scale)
+    dims = [sub.tech_depth, sub.problem_solving, sub.system_design,
+            sub.communication, sub.collaboration, sub.culture_fit, sub.growth_mindset]
+    human_score = round(sum(dims) / len(dims) * 10, 1)
+
+    # Combined AI score (already computed earlier in pipeline)
+    ai_combined = candidate.get("combined_ai_score") or candidate.get("ai_interview_score", 0)
+
+    # Final = AI 60% + Human 40%
+    final_score = round((ai_combined * 0.6) + (human_score * 0.4), 1)
+
+    rec_pass = sub.recommendation in ("strong_hire", "hire")
+
+    update_candidate(candidate_id, {
+        "human_score": human_score,
+        "human_tech_score": sub.tech_depth,
+        "human_scorecard": sub.dict(),
+        "human_recommendation": sub.recommendation,
+        "combined_final_score": final_score,
+        "status": "technical_complete_pending_hr"
+    })
+    update_assignment(sub.assignment_id, {
+        "feedback_submitted": True,
+        "status": "completed"
+    })
+
+    log_agent("EVALUATOR", "human_feedback",
+              f"Human: {human_score}/100 | Final: {final_score}/100 | {sub.recommendation}",
+              candidate_id)
+
+    # Email combined report to HR who posted the JD
+    _email_combined_report(candidate, candidate_id, human_score, ai_combined,
+                           final_score, sub, rec_pass)
+
+    return {"success": True, "final_score": final_score}
+
+
+def _email_combined_report(candidate, candidate_id, human_score, ai_combined,
+                           final_score, sub, rec_pass):
+    from shared.cosmos_client import get_hr_user
+    from agents.communicator.agent import send_email
+
+    hr_id = candidate.get("hr_id", "")
+    hr = get_hr_user(hr_id) if hr_id else None
+    hr_email = hr.get("email") if hr else "jefrijebason@gmail.com"
+    hr_name = hr.get("name", "Hiring Manager") if hr else "Hiring Manager"
+
+    base = getattr(config, "PUBLIC_URL", "http://localhost:8000")
+    approve_url = f"{base}/api/hr/approve/{candidate_id}"
+    reject_url = f"{base}/api/hr/reject/{candidate_id}"
+
+    rec_label = sub.recommendation.replace("_", " ").title()
+    rec_color = "#16a34a" if rec_pass else "#dc2626"
+
+    send_email(
+        to_address=hr_email,
+        subject=f"Evaluation Report: {candidate.get('name')} — {rec_label}",
+        body_html=f"""
+<div style="font-family:Segoe UI,sans-serif;max-width:600px">
+<h2>Candidate Evaluation Report</h2>
+<p>Hi {hr_name},</p>
+<p>The technical interview for <strong>{candidate.get('name')}</strong>
+({candidate.get('applied_role','')}) is complete.</p>
+
+<table style="border-collapse:collapse;width:100%;margin:16px 0">
+<tr style="background:#eff6ff"><td style="padding:10px;font-weight:bold">AI Score (Resume + Interview + Coding)</td>
+<td style="padding:10px">{ai_combined:.1f}/100</td></tr>
+<tr><td style="padding:10px;font-weight:bold">Human Score (Interviewer)</td>
+<td style="padding:10px">{human_score}/100</td></tr>
+<tr style="background:#f0fdf4"><td style="padding:10px;font-weight:bold">FINAL (AI 60% + Human 40%)</td>
+<td style="padding:10px;font-size:18px;font-weight:bold">{final_score}/100</td></tr>
+<tr><td style="padding:10px;font-weight:bold">Recommendation</td>
+<td style="padding:10px;color:{rec_color};font-weight:bold">{rec_label}</td></tr>
+<tr style="background:#eff6ff"><td style="padding:10px;font-weight:bold">Suggested Salary</td>
+<td style="padding:10px">{sub.suggested_salary or 'Not specified'} LPA</td></tr>
+</table>
+
+<p><strong>Strengths:</strong> {sub.strengths or 'None noted'}</p>
+<p><strong>Concerns:</strong> {sub.concerns or 'None noted'}</p>
+
+<div style="margin:24px 0">
+<a href="{approve_url}" style="display:inline-block;background:#16a34a;color:#fff;
+padding:12px 28px;text-decoration:none;border-radius:8px;font-weight:bold;margin-right:10px">
+✓ Approve & Schedule HR Round</a>
+<a href="{reject_url}" style="display:inline-block;background:#dc2626;color:#fff;
+padding:12px 28px;text-decoration:none;border-radius:8px;font-weight:bold">
+✗ Reject</a>
+</div>
+<p style="color:#94a3b8;font-size:12px">HR decision required to proceed.</p>
+</div>
+""")
+
+
+@app.get("/api/hr/approve/{candidate_id}", response_class=HTMLResponse)
+def hr_approve(candidate_id: str):
+    """HR approves → schedule HR round → notify candidate."""
+    from shared.cosmos_client import get_candidate, update_candidate
+    from agents.scheduler.agent import run_scheduler
+    from shared.agent_feed import log_agent
+
+    candidate = get_candidate(candidate_id)
+    if not candidate:
+        return HTMLResponse("<h2>Candidate not found</h2>", status_code=404)
+
+    update_candidate(candidate_id, {"status": "waiting_hr_interview"})
+    log_agent("ORCHESTRATOR", "hr_approved", "HR approved — scheduling HR round", candidate_id)
+
+    try:
+        run_scheduler(candidate_id, "hr", send_candidate_email=True)
+    except Exception as e:
+        print(f"[HR APPROVE] Scheduler error: {e}")
+
+    return HTMLResponse(f"""
+    <div style="font-family:Segoe UI,sans-serif;max-width:600px;margin:80px auto;text-align:center">
+      <div style="font-size:48px">✅</div>
+      <h2 style="color:#16a34a">HR Round Scheduled</h2>
+      <p style="color:#64748b">{candidate.get('name')} has been notified with the HR round details and meeting link.</p>
+    </div>""")
+
+
+@app.get("/api/hr/reject/{candidate_id}", response_class=HTMLResponse)
+def hr_reject(candidate_id: str):
+    """HR rejects → growth report to candidate."""
+    from shared.cosmos_client import get_candidate, update_candidate
+    from agents.orchestrator.agent import _send_rejection_with_growth
+    from shared.agent_feed import log_agent
+
+    candidate = get_candidate(candidate_id)
+    if not candidate:
+        return HTMLResponse("<h2>Candidate not found</h2>", status_code=404)
+
+    update_candidate(candidate_id, {"status": "rejected"})
+    log_agent("ORCHESTRATOR", "hr_rejected", "HR rejected after technical review", candidate_id)
+
+    try:
+        _send_rejection_with_growth(candidate_id)
+    except Exception as e:
+        print(f"[HR REJECT] error: {e}")
+
+    return HTMLResponse(f"""
+    <div style="font-family:Segoe UI,sans-serif;max-width:600px;margin:80px auto;text-align:center">
+      <div style="font-size:48px">📋</div>
+      <h2>Candidate Notified</h2>
+      <p style="color:#64748b">{candidate.get('name')} has been sent a respectful rejection with a growth report.</p>
+    </div>""")
+
 # ── Run Server ───────────────────────────────────────────────────
 if __name__ == "__main__":
     uvicorn.run(
