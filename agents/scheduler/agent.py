@@ -220,7 +220,7 @@ def run_scheduler(candidate_id: str,
     meeting_url = result.get("meeting_url", "")
     if not result.get("success") or not meeting_url:
         print("[SCHEDULER] Teams meeting not created — using text-only fallback")
-        meeting_url = ""  # Empty = no link shown in email
+        meeting_url = "https://teams.live.com/meet/9367792243138?p=sZHbbDKnF227zfxcDK" 
 
     slot_str = slot.strftime("%A %B %d, %Y at %I:%M %p IST")
 

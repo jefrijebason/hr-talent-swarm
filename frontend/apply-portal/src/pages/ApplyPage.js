@@ -1,10 +1,10 @@
 import React, { useState } from 'react';
-import { motion, AnimatePresence } from 'framer-motion';
+import { motion } from 'framer-motion';
 import axios from 'axios';
 import { theme, fonts } from '../theme';
 import {
   GlassCard, AuroraButton, GradientText, SkillPill,
-  GlassInput, AnimatedRing, ScrollReveal
+  GlassInput, ScrollReveal
 } from '../components';
 
 const API_URL = process.env.REACT_APP_API_URL || 'http://localhost:8000';
@@ -16,16 +16,13 @@ export default function ApplyPage({ job, onBack, onSuccess }) {
   const [errors, setErrors]       = useState({});
   const [resume, setResume]       = useState(null);
   const [scanState, setScanState] = useState('idle');
-  // idle | scanning | done
   const [parsed, setParsed]       = useState(null);
   const [screenAnswers, setScreenAnswers] = useState({});
   const [knockout, setKnockout]   = useState(false);
-  const [strength, setStrength]   = useState(null);
   const [submitting, setSubmitting] = useState(false);
 
   const questions = job?.screening_questions || [];
 
-  // ── Resume Upload + Animated Scan ──────────────────────────────
   const handleFile = (file) => {
     if (!file || file.type !== 'application/pdf') {
       setErrors({ ...errors, resume: 'Please upload a PDF file' });
@@ -35,7 +32,6 @@ export default function ApplyPage({ job, onBack, onSuccess }) {
     setErrors({ ...errors, resume: null });
     setScanState('scanning');
 
-    // Simulate AI parse (placeholder — real parse happens on submit)
     setTimeout(() => {
       const detected = (job?.tech_stack || ['Python', 'Azure', 'ML']).slice(0, 5);
       setParsed({
@@ -44,27 +40,21 @@ export default function ApplyPage({ job, onBack, onSuccess }) {
         education: 'B.Tech, Computer Science'
       });
       setScanState('done');
-      // compute strength
-      const fit = Math.min(10, 6 + detected.length * 0.5).toFixed(1);
-      setTimeout(() => setStrength(parseFloat(fit)), 400);
     }, 2400);
   };
 
-  // ── Screening Answer ───────────────────────────────────────────
   const answerQuestion = (idx, val) => {
     setScreenAnswers({ ...screenAnswers, [idx]: val });
     const q = questions[idx];
     if (q.knockout && val === q.knockout_answer) {
       setKnockout(true);
     } else {
-      // re-check all
       const stillKnocked = questions.some((qq, i) =>
         qq.knockout && (i === idx ? val : screenAnswers[i]) === qq.knockout_answer);
       setKnockout(stillKnocked);
     }
   };
 
-  // ── Validate + Submit ──────────────────────────────────────────
   const validate = () => {
     const e = {};
     if (!form.name.trim()) e.name = 'Name is required';
@@ -210,8 +200,7 @@ export default function ApplyPage({ job, onBack, onSuccess }) {
                   <div>💼 Experience: <strong>{parsed.experience}</strong></div>
                   <div>🎓 {parsed.education}</div>
                 </div>
-                <button onClick={() => { setScanState('idle'); setResume(null);
-                  setParsed(null); setStrength(null); }}
+                <button onClick={() => { setScanState('idle'); setResume(null); setParsed(null); }}
                   style={{ marginTop: '12px', background: 'none', border: 'none',
                     color: theme.primary, cursor: 'pointer', fontSize: '12px',
                     fontFamily: 'inherit' }}>
@@ -273,50 +262,22 @@ export default function ApplyPage({ job, onBack, onSuccess }) {
         </ScrollReveal>
       )}
 
-      {/* Section 4 — Profile Strength */}
-      {strength !== null && !knockout && (
-        <ScrollReveal style={{ marginBottom: '24px' }}>
-          <GlassCard hover={false} glow style={{ textAlign: 'center' }}>
-            <h3 style={{ ...fonts.h3, color: theme.textPrimary, marginTop: 0,
-              marginBottom: '16px' }}>4. Your Fit for This Role</h3>
-            <AnimatedRing score={strength} />
-            <div style={{ marginTop: '16px', display: 'flex', gap: '24px',
-              justifyContent: 'center', flexWrap: 'wrap' }}>
-              <div>
-                <div style={{ fontSize: '12px', color: theme.success, fontWeight: 700 }}>
-                  ✓ Strong Match
-                </div>
-                <div style={{ fontSize: '12px', color: theme.textSecondary }}>
-                  {(parsed?.skills || []).slice(0, 2).join(', ')}
-                </div>
-              </div>
-              <div>
-                <div style={{ fontSize: '12px', color: theme.warning, fontWeight: 700 }}>
-                  ⚡ Could Strengthen
-                </div>
-                <div style={{ fontSize: '12px', color: theme.textSecondary }}>
-                  System Design, Leadership
-                </div>
-              </div>
-            </div>
-          </GlassCard>
+      {/* Submit Button */}
+      {!knockout && (
+        <ScrollReveal>
+          <AuroraButton
+            onClick={handleSubmit}
+            disabled={submitting}
+            style={{ width: '100%', padding: '16px', fontSize: '16px' }}>
+            {submitting ? '⏳ Submitting...' : '🚀 Submit Application'}
+          </AuroraButton>
+          <p style={{ fontSize: '12px', color: theme.textTertiary,
+            textAlign: 'center', marginTop: '12px' }}>
+            🤖 AI-powered evaluation · Bias removed · Everyone gets feedback
+          </p>
         </ScrollReveal>
       )}
 
-      {/* Submit */}
-      <ScrollReveal>
-        <AuroraButton full disabled={submitting || knockout}
-          onClick={handleSubmit}
-          style={{ padding: '16px', fontSize: '16px' }}>
-          {submitting ? '⏳ Submitting...'
-            : knockout ? 'Not Eligible for This Role'
-            : 'Submit Application →'}
-        </AuroraButton>
-        <p style={{ fontSize: '12px', color: theme.textTertiary,
-          textAlign: 'center', marginTop: '12px' }}>
-          Bias is removed before AI evaluation. You'll receive feedback regardless of outcome.
-        </p>
-      </ScrollReveal>
     </div>
   );
 }

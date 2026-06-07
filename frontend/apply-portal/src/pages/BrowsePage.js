@@ -30,9 +30,10 @@ export default function BrowsePage({ onSelectJob }) {
     setIsLoading(true);
     axios.get(`${API_URL}/api/jobs`)
       .then(r => {
-        if (r.data && r.data.length > 0) {
-          setJobs(r.data);
-          setSelected(r.data[0]);
+        const activeJobs = (r.data || []).filter(j => j.status !== 'closed');
+        if (activeJobs.length > 0) {
+          setJobs(activeJobs);
+          setSelected(activeJobs[0]);
         } else {
           setJobs([]);
           setSelected(null);
@@ -54,7 +55,6 @@ export default function BrowsePage({ onSelectJob }) {
     return matchSearch && matchLoc && matchDept;
   });
 
-  // Show loading skeleton while fetching
   if (isLoading) {
     return (
       <div style={{ maxWidth: '1200px', margin: '0 auto', padding: '40px 24px 80px' }}>
@@ -79,7 +79,6 @@ export default function BrowsePage({ onSelectJob }) {
     );
   }
 
-  // Show empty state if no jobs
   if (jobs.length === 0) {
     return (
       <div style={{ maxWidth: '1200px', margin: '0 auto', padding: '60px 24px 80px', textAlign: 'center' }}>
@@ -93,7 +92,6 @@ export default function BrowsePage({ onSelectJob }) {
   return (
     <div style={{ maxWidth: '1200px', margin: '0 auto', padding: '40px 24px 80px' }}>
 
-      {/* Hero */}
       <motion.div
         initial={{ opacity: 0, y: 30 }} animate={{ opacity: 1, y: 0 }}
         transition={{ duration: 0.7 }}
@@ -121,7 +119,6 @@ export default function BrowsePage({ onSelectJob }) {
         </div>
       </motion.div>
 
-      {/* Search + Filters */}
       <ScrollReveal>
         <GlassCard hover={false} style={{ marginBottom: '28px' }}>
           <GlassInput
@@ -153,11 +150,9 @@ export default function BrowsePage({ onSelectJob }) {
         </GlassCard>
       </ScrollReveal>
 
-      {/* Split View (desktop) / Cards (mobile) */}
       <div style={{ display: 'grid',
         gridTemplateColumns: isMobile ? '1fr' : '380px 1fr', gap: '20px' }}>
 
-        {/* Job List */}
         <div style={{ display: 'flex', flexDirection: 'column', gap: '14px' }}>
           {filtered.map((job, i) => (
             <motion.div key={job.id}
@@ -187,8 +182,7 @@ export default function BrowsePage({ onSelectJob }) {
                     <SkillPill>+{job.tech_stack.length - 3}</SkillPill>
                   )}
                 </div>
-                <div style={{ marginTop: '10px', fontSize: '11px',
-                  color: theme.success }}>
+                <div style={{ marginTop: '10px', fontSize: '11px', color: theme.success }}>
                   ● Actively hiring · {job.posted_days_ago}d ago
                 </div>
               </GlassCard>
@@ -196,7 +190,6 @@ export default function BrowsePage({ onSelectJob }) {
           ))}
         </div>
 
-        {/* Detail Panel (desktop only) */}
         {!isMobile && selected && (
           <div style={{ position: 'sticky', top: '90px', alignSelf: 'start' }}>
             <AnimatePresence mode="wait">

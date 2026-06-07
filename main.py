@@ -1050,6 +1050,14 @@ def complete_ai_interview(
             return {"success": False, "message": str(e)}
     except Exception as e:
         return {"success": False, "message": "Interview recorded with error."}
+    
+# ── Live Agent Feed ──────────────────────────────────────────────
+from shared.agent_feed import get_feed, log_agent
+
+@app.get("/api/agent-feed")
+def agent_feed(limit: int = 50):
+    return get_feed(limit)
+
 # ── Run Server ───────────────────────────────────────────────────
 if __name__ == "__main__":
     uvicorn.run(

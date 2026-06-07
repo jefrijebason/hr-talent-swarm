@@ -242,6 +242,16 @@ def get_pipeline_stats() -> dict:
             stats["applied"] += 1
     return stats
 
+def update_job(job_id: str, updates: dict):
+    if not job_id:
+        return
+    try:
+        job = col("jobs").read_item(job_id, partition_key=job_id)
+        job.update(updates)
+        col("jobs").upsert_item(job)
+    except Exception as e:
+        print(f"[DB] Job update error: {e}")
+
 def get_bias_report() -> dict:
     all_candidates = get_all_candidates()
     total  = len(all_candidates)

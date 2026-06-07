@@ -91,3 +91,4 @@ Terminal 1: venv\Scripts\activate && python main.py
 Terminal 2: npx localtunnel --port 8000 --subdomain hrswarm
 Terminal 3: cd frontend\dashboard && npm start
 Terminal 4: cd frontend\apply-portal && npm start (port 3001)
+Terminal 5: cd frontend\coding-portal && npm start

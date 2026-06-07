@@ -1,12 +1,12 @@
 from shared.openai_client import ask_gpt4o_mini, parse_json
 from shared.cosmos_client import update_candidate, write_audit
 from shared.config import config
+from shared.agent_feed import log_agent
 from azure.storage.blob import BlobServiceClient
 import pdfplumber
 import io
 
 def extract_text_from_pdf(pdf_bytes: bytes) -> str:
-    """Extract text from PDF resume."""
     try:
         with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
             text = ""
@@ -15,14 +15,12 @@ def extract_text_from_pdf(pdf_bytes: bytes) -> str:
             return text
     except Exception as e:
         print(f"[SCREENER] PDF error: {e}")
-        # Try reading as plain text
         try:
             return pdf_bytes.decode("utf-8")
         except Exception:
             return ""
 
 def remove_bias(resume_text: str) -> str:
-    """Remove identifying information from resume."""
     prompt = f"""
 Remove all personally identifying information from this resume.
 Replace or remove: full name, email, phone number, gender signals,
@@ -37,7 +35,6 @@ RESUME:
     return ask_gpt4o_mini(prompt)
 
 def score_resume(anonymized_text: str, job_role: str) -> dict:
-    """Score candidate resume using GPT-4o Mini."""
     prompt = f"""
 You are an expert technical recruiter. Score this anonymized resume.
 
@@ -76,18 +73,12 @@ Return ONLY valid JSON. No markdown. No explanation outside JSON.
     response = ask_gpt4o_mini(prompt)
     return parse_json(response)
 
-def upload_resume_to_blob(pdf_bytes: bytes,
-                          candidate_id: str) -> str:
-    """Upload resume to Azure Blob Storage."""
+def upload_resume_to_blob(pdf_bytes: bytes, candidate_id: str) -> str:
     try:
-        blob_service = BlobServiceClient.from_connection_string(
-            config.BLOB_CONNECTION
-        )
+        blob_service = BlobServiceClient.from_connection_string(config.BLOB_CONNECTION)
         blob_name   = f"{candidate_id}.pdf"
         blob_client = blob_service.get_blob_client(
-            container=config.BLOB_CONTAINER,
-            blob=blob_name
-        )
+            container=config.BLOB_CONTAINER, blob=blob_name)
         blob_client.upload_blob(pdf_bytes, overwrite=True)
         print(f"[SCREENER] Resume uploaded: {blob_name}")
         return blob_name
@@ -95,42 +86,43 @@ def upload_resume_to_blob(pdf_bytes: bytes,
         print(f"[SCREENER] Blob upload error: {e}")
         return ""
 
-def run_screener(candidate_id: str,
-                 pdf_bytes: bytes,
-                 job_role: str) -> dict:
-    """
-    Main screener function.
-    Works with both real PDFs and plain text.
-    """
+def run_screener(candidate_id: str, pdf_bytes: bytes, job_role: str) -> dict:
     print(f"[SCREENER] Starting for: {candidate_id}")
+    log_agent("SCREENER", "started", f"Analyzing resume for {job_role}", candidate_id)
 
     # Upload to Blob Storage
     upload_resume_to_blob(pdf_bytes, candidate_id)
 
-    # Extract text — handles both PDF and plain text
+    # Extract text
     print(f"[SCREENER] Extracting text...")
+    log_agent("SCREENER", "extracting", "Reading PDF and extracting text", candidate_id)
     resume_text = extract_text_from_pdf(pdf_bytes)
 
     if not resume_text or len(resume_text.strip()) < 50:
         print(f"[SCREENER] Could not extract text")
+        log_agent("SCREENER", "error", "Could not read resume", candidate_id)
         return {"error": "Could not read resume"}
 
     print(f"[SCREENER] Extracted {len(resume_text)} characters")
+    log_agent("SCREENER", "extracted", f"Extracted {len(resume_text)} characters", candidate_id)
 
     # Remove bias
     print(f"[SCREENER] Removing bias...")
+    log_agent("SCREENER", "bias_removal", "Stripping PII — name, gender, age, photo removed", candidate_id)
     anonymized = remove_bias(resume_text)
+    log_agent("SCREENER", "bias_removed", "Resume anonymized for fair evaluation", candidate_id)
 
     # Score resume
     print(f"[SCREENER] Scoring candidate...")
+    log_agent("SCREENER", "scoring", "AI evaluating skills, experience, and fit", candidate_id)
     result = score_resume(anonymized, job_role)
 
     # Save to Cosmos DB
     update_candidate(candidate_id, {
-        "resume_score":    result["overall_score"],
-        "skills":          result["skills"],
+        "resume_score":     result["overall_score"],
+        "skills":           result["skills"],
         "experience_years": result["experience_years"],
-        "status":          "screened"
+        "status":           "screened"
     })
 
     write_audit(candidate_id, "SCREENER", "resume_scored", {
@@ -140,4 +132,8 @@ def run_screener(candidate_id: str,
     })
 
     print(f"[SCREENER] Score: {result['overall_score']}/100")
+    log_agent("SCREENER", "resume_scored",
+        f"Score: {result['overall_score']}/100 | Skills: {', '.join(result.get('skills', [])[:3])}",
+        candidate_id)
+
     return result
