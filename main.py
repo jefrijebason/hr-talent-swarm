@@ -1264,6 +1264,7 @@ def _email_combined_report(candidate, candidate_id, human_score, ai_combined,
 
     base = getattr(config, "PUBLIC_URL", "http://localhost:8000")
     approve_url = f"{base}/api/hr/approve/{candidate_id}"
+    decision_url = f"{base}/hr/decision/{candidate_id}"
     reject_url = f"{base}/api/hr/reject/{candidate_id}"
 
     rec_label = sub.recommendation.replace("_", " ").title()
@@ -1299,10 +1300,17 @@ def _email_combined_report(candidate, candidate_id, human_score, ai_combined,
 <a href="{approve_url}" style="display:inline-block;background:#16a34a;color:#fff;
 padding:12px 28px;text-decoration:none;border-radius:8px;font-weight:bold;margin-right:10px">
 ✓ Approve & Schedule HR Round</a>
+<a href="{decision_url}" style="display:inline-block;
+  background:#6366f1;color:#fff;padding:12px 28px;
+  text-decoration:none;border-radius:8px;font-weight:bold;
+  margin-top:10px">
+  📋 Open Decision Form (Offer / Decline / Talent Pool)
+</a>
 <a href="{reject_url}" style="display:inline-block;background:#dc2626;color:#fff;
 padding:12px 28px;text-decoration:none;border-radius:8px;font-weight:bold">
 ✗ Reject</a>
 </div>
+
 <p style="color:#94a3b8;font-size:12px">HR decision required to proceed.</p>
 </div>
 """)
@@ -1360,6 +1368,371 @@ def hr_reject(candidate_id: str):
       <h2>Candidate Notified</h2>
       <p style="color:#64748b">{candidate.get('name')} has been sent a respectful rejection with a growth report.</p>
     </div>""")
+# ── HR Decision Form ─────────────────────────────────────────────
+
+@app.get("/hr/decision/{candidate_id}", response_class=HTMLResponse)
+def hr_decision_form(candidate_id: str):
+    from shared.cosmos_client import get_candidate
+    candidate = get_candidate(candidate_id)
+    if not candidate:
+        return HTMLResponse("<h2>Candidate not found</h2>", status_code=404)
+
+    if candidate.get("hr_decision_submitted"):
+        return HTMLResponse(f"""
+        <div style="font-family:Segoe UI,sans-serif;max-width:600px;
+          margin:80px auto;text-align:center">
+          <div style="font-size:48px">✅</div>
+          <h2>Decision Already Submitted</h2>
+          <p style="color:#64748b">A decision has already been recorded
+          for {candidate.get('name')}.</p>
+        </div>""")
+
+    name = candidate.get("name", "")
+    role = candidate.get("applied_role", "")
+    resume_score = candidate.get("resume_score", "N/A")
+    ai_score = candidate.get("ai_interview_score", "N/A")
+    coding_score = candidate.get("coding_score", "N/A")
+    human_score = candidate.get("human_score", "N/A")
+    final_score = candidate.get("combined_final_score", "N/A")
+    expected_ctc = candidate.get("expected_ctc", "")
+
+    return HTMLResponse(f"""
+<!DOCTYPE html><html><head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>HR Decision — {name}</title></head>
+<body style="font-family:Segoe UI,sans-serif;background:#f1f5f9;
+  margin:0;padding:24px">
+<div style="max-width:680px;margin:0 auto;background:#fff;
+  border-radius:16px;padding:32px;
+  box-shadow:0 4px 20px rgba(0,0,0,0.08)">
+
+  <h1 style="color:#0f172a;margin:0 0 4px">HR Decision Form</h1>
+  <p style="color:#64748b;margin:0 0 20px">
+    Candidate: <strong>{name}</strong> — {role}
+  </p>
+
+  <!-- Score Summary -->
+  <div style="background:#eff6ff;border-radius:10px;
+    padding:16px;margin-bottom:24px">
+    <div style="font-weight:700;color:#1e40af;margin-bottom:10px">
+      Complete Evaluation Summary
+    </div>
+    <div style="display:grid;grid-template-columns:repeat(5,1fr);
+      gap:8px;text-align:center">
+      {_score_box("Resume", resume_score)}
+      {_score_box("AI Interview", ai_score)}
+      {_score_box("Coding", coding_score)}
+      {_score_box("Technical", human_score)}
+      {_score_box("FINAL", final_score, highlight=True)}
+    </div>
+  </div>
+
+  <!-- Decision Selector -->
+  <div style="margin-bottom:24px">
+    <label style="display:block;font-weight:700;font-size:16px;
+      margin-bottom:12px;color:#0f172a">Select Decision</label>
+    <div style="display:flex;gap:10px;flex-wrap:wrap">
+      {_decision_btn("offer", "✅ Send Offer Letter", "#16a34a")}
+      {_decision_btn("decline", "❌ Decline Candidate", "#dc2626")}
+      {_decision_btn("talent_pool", "⭐ Add to Talent Pool", "#d97706")}
+    </div>
+  </div>
+
+  <!-- Offer Letter Section -->
+  <div id="offer_section" style="display:none;background:#f0fdf4;
+    border:1px solid #86efac;border-radius:12px;padding:20px;
+    margin-bottom:20px">
+    <h3 style="color:#15803d;margin:0 0 16px">Offer Letter Details</h3>
+    <div style="display:grid;grid-template-columns:1fr 1fr;gap:12px">
+      <div>
+        <label style="display:block;font-weight:600;font-size:13px;
+          margin-bottom:6px;color:#374151">Offered Salary (LPA)</label>
+        <input id="salary" placeholder="e.g. 22"
+          value="{expected_ctc}"
+          style="width:100%;padding:10px;border:1px solid #e2e8f0;
+          border-radius:8px;box-sizing:border-box">
+      </div>
+      <div>
+        <label style="display:block;font-weight:600;font-size:13px;
+          margin-bottom:6px;color:#374151">Start Date</label>
+        <input id="start_date" type="date"
+          style="width:100%;padding:10px;border:1px solid #e2e8f0;
+          border-radius:8px;box-sizing:border-box">
+      </div>
+      <div>
+        <label style="display:block;font-weight:600;font-size:13px;
+          margin-bottom:6px;color:#374151">Role / Title</label>
+        <input id="role_title" value="{role}"
+          style="width:100%;padding:10px;border:1px solid #e2e8f0;
+          border-radius:8px;box-sizing:border-box">
+      </div>
+      <div>
+        <label style="display:block;font-weight:600;font-size:13px;
+          margin-bottom:6px;color:#374151">Work Mode</label>
+        <select id="work_mode" style="width:100%;padding:10px;
+          border:1px solid #e2e8f0;border-radius:8px">
+          <option>Hybrid</option>
+          <option>Remote</option>
+          <option>On-site</option>
+        </select>
+      </div>
+      <div style="grid-column:1/-1">
+        <label style="display:block;font-weight:600;font-size:13px;
+          margin-bottom:6px;color:#374151">
+          Additional Benefits / Notes
+        </label>
+        <textarea id="benefits" rows="3"
+          placeholder="Health insurance, 25 days leave, etc."
+          style="width:100%;padding:10px;border:1px solid #e2e8f0;
+          border-radius:8px;box-sizing:border-box;resize:vertical">
+        </textarea>
+      </div>
+    </div>
+  </div>
+
+  <!-- Decline / Talent Pool Notes -->
+  <div id="notes_section" style="display:none;margin-bottom:20px">
+    <label style="display:block;font-weight:600;font-size:13px;
+      margin-bottom:6px;color:#374151">Notes (optional)</label>
+    <textarea id="notes" rows="3"
+      placeholder="Reason or message for the candidate..."
+      style="width:100%;padding:10px;border:1px solid #e2e8f0;
+      border-radius:8px;box-sizing:border-box;resize:vertical">
+    </textarea>
+  </div>
+
+  <button id="submit_btn" onclick="submitDecision()"
+    style="display:none;width:100%;padding:14px;
+    background:linear-gradient(135deg,#6366f1,#7c3aed);
+    color:#fff;border:none;border-radius:10px;font-size:16px;
+    font-weight:700;cursor:pointer">
+    Confirm Decision →
+  </button>
+
+  <div id="msg" style="display:none;text-align:center;padding:40px">
+    <div style="font-size:48px">✅</div>
+    <h2 style="color:#16a34a">Decision Submitted!</h2>
+    <p style="color:#64748b">Candidate has been notified.</p>
+  </div>
+</div>
+
+<script>
+let selectedDecision = '';
+
+function selectDecision(d) {{
+  selectedDecision = d;
+  document.querySelectorAll('.dec-btn').forEach(b => {{
+    b.style.opacity = '0.5';
+    b.style.transform = 'scale(0.98)';
+  }});
+  document.getElementById('btn_' + d).style.opacity = '1';
+  document.getElementById('btn_' + d).style.transform = 'scale(1.02)';
+  document.getElementById('offer_section').style.display =
+    d === 'offer' ? 'block' : 'none';
+  document.getElementById('notes_section').style.display =
+    d !== 'offer' ? 'block' : 'none';
+  document.getElementById('submit_btn').style.display = 'block';
+  const colors = {{
+    offer: 'linear-gradient(135deg,#16a34a,#15803d)',
+    decline: 'linear-gradient(135deg,#dc2626,#b91c1c)',
+    talent_pool: 'linear-gradient(135deg,#d97706,#b45309)'
+  }};
+  document.getElementById('submit_btn').style.background =
+    colors[d];
+}}
+
+async function submitDecision() {{
+  if (!selectedDecision) {{ alert('Please select a decision'); return; }}
+  const payload = {{
+    candidate_id: "{candidate_id}",
+    decision: selectedDecision,
+    salary: document.getElementById('salary')?.value || '',
+    start_date: document.getElementById('start_date')?.value || '',
+    role_title: document.getElementById('role_title')?.value || '',
+    work_mode: document.getElementById('work_mode')?.value || '',
+    benefits: document.getElementById('benefits')?.value || '',
+    notes: document.getElementById('notes')?.value || ''
+  }};
+  try {{
+    const r = await fetch('/api/hr/decision/submit', {{
+      method: 'POST',
+      headers: {{'Content-Type': 'application/json'}},
+      body: JSON.stringify(payload)
+    }});
+    if (r.ok) {{
+      document.querySelector('form') &&
+        (document.querySelector('form').style.display = 'none');
+      document.getElementById('msg').style.display = 'block';
+      document.getElementById('submit_btn').style.display = 'none';
+    }} else {{ alert('Submission failed. Try again.'); }}
+  }} catch {{ alert('Network error. Try again.'); }}
+}}
+</script>
+</body></html>""")
+
+
+def _score_box(label, val, highlight=False):
+    bg = "#4f46e5" if highlight else "#fff"
+    color = "#fff" if highlight else "#1e40af"
+    return f"""<div style="background:{bg};border-radius:8px;
+      padding:10px;border:1px solid #bfdbfe">
+      <div style="font-size:18px;font-weight:800;color:{color}">
+        {val}
+      </div>
+      <div style="font-size:10px;color:{'#c7d2fe' if highlight else '#64748b'}">
+        {label}
+      </div>
+    </div>"""
+
+
+def _decision_btn(key, label, color):
+    return f"""<button id="btn_{key}" class="dec-btn"
+      onclick="selectDecision('{key}')"
+      style="flex:1;min-width:160px;padding:12px 16px;
+      border:2px solid {color};border-radius:10px;
+      background:transparent;color:{color};
+      font-weight:700;font-size:14px;cursor:pointer;
+      transition:all 0.2s">
+      {label}
+    </button>"""
+
+
+class HRDecisionRequest(BaseModel):
+    candidate_id: str
+    decision: str
+    salary: str = ""
+    start_date: str = ""
+    role_title: str = ""
+    work_mode: str = ""
+    benefits: str = ""
+    notes: str = ""
+
+
+@app.post("/api/hr/decision/submit")
+def hr_decision_submit(req: HRDecisionRequest):
+    from shared.cosmos_client import get_candidate, update_candidate
+    from agents.communicator.agent import send_email
+    from shared.agent_feed import log_agent
+
+    candidate = get_candidate(req.candidate_id)
+    if not candidate:
+        raise HTTPException(status_code=404, detail="Candidate not found")
+
+    name = candidate.get("name", "")
+    role = candidate.get("applied_role", "")
+    email = candidate.get("email", "")
+
+    update_candidate(req.candidate_id, {
+        "hr_decision": req.decision,
+        "hr_decision_submitted": True,
+        "agreed_salary": req.salary,
+        "status": "hired" if req.decision == "offer"
+                  else "rejected" if req.decision == "decline"
+                  else "talent_pool"
+    })
+
+    log_agent("ORCHESTRATOR", f"hr_decision_{req.decision}",
+              f"{name} — {req.decision}", req.candidate_id)
+
+    if req.decision == "offer":
+        _send_offer_letter(candidate, req)
+    elif req.decision == "decline":
+        from agents.orchestrator.agent import _send_rejection_with_growth
+        _send_rejection_with_growth(req.candidate_id)
+    else:  # talent_pool
+        _send_talent_pool_email(candidate, req.notes)
+
+    return {"success": True, "decision": req.decision}
+
+
+def _send_offer_letter(candidate: dict, req: HRDecisionRequest):
+    from agents.communicator.agent import send_email
+    send_email(
+        to_address=candidate.get("email"),
+        subject=f"🎉 Offer Letter — {req.role_title}",
+        body_html=f"""
+<div style="font-family:Segoe UI,sans-serif;max-width:600px;
+  border:2px solid #6366f1;border-radius:16px;padding:32px">
+  <div style="text-align:center;margin-bottom:24px">
+    <div style="font-size:48px">🎉</div>
+    <h1 style="color:#4f46e5;margin:8px 0">Congratulations!</h1>
+    <p style="color:#64748b">We are delighted to offer you a position.</p>
+  </div>
+
+  <h2 style="color:#0f172a;border-bottom:2px solid #eff6ff;
+    padding-bottom:8px">Official Offer Letter</h2>
+
+  <p>Dear <strong>{candidate.get('name')}</strong>,</p>
+  <p>After a thorough evaluation process, we are pleased to extend
+  this formal offer of employment.</p>
+
+  <table style="border-collapse:collapse;width:100%;margin:20px 0">
+    <tr style="background:#eff6ff">
+      <td style="padding:12px;font-weight:bold">Position</td>
+      <td style="padding:12px">{req.role_title}</td>
+    </tr>
+    <tr>
+      <td style="padding:12px;font-weight:bold">Salary</td>
+      <td style="padding:12px;font-size:18px;
+        color:#16a34a;font-weight:bold">
+        ₹{req.salary} LPA
+      </td>
+    </tr>
+    <tr style="background:#eff6ff">
+      <td style="padding:12px;font-weight:bold">Start Date</td>
+      <td style="padding:12px">{req.start_date or 'To be confirmed'}</td>
+    </tr>
+    <tr>
+      <td style="padding:12px;font-weight:bold">Work Mode</td>
+      <td style="padding:12px">{req.work_mode}</td>
+    </tr>
+    <tr style="background:#eff6ff">
+      <td style="padding:12px;font-weight:bold">Benefits</td>
+      <td style="padding:12px">{req.benefits or 'Standard package'}</td>
+    </tr>
+  </table>
+
+  <div style="background:#f0fdf4;border:1px solid #86efac;
+    border-radius:10px;padding:16px;margin:20px 0">
+    <p style="color:#15803d;font-weight:600;margin:0 0 8px">
+      Next Steps:
+    </p>
+    <ol style="color:#166534;margin:0;padding-left:20px">
+      <li>Reply to this email to accept the offer</li>
+      <li>Complete the onboarding form (link to follow)</li>
+      <li>We will send your joining kit 3 days before start date</li>
+    </ol>
+  </div>
+
+  <p>Please respond within <strong>5 business days</strong>.
+  We look forward to having you on the team!</p>
+
+  <p>Warm regards,<br><strong>HR Team</strong></p>
+</div>
+""")
+
+
+def _send_talent_pool_email(candidate: dict, notes: str = ""):
+    from agents.communicator.agent import send_email
+    from shared.cosmos_client import add_to_talent_pool
+    add_to_talent_pool(candidate)
+    send_email(
+        to_address=candidate.get("email"),
+        subject=f"Your Application — {candidate.get('applied_role', '')}",
+        body_html=f"""
+<div style="font-family:Segoe UI,sans-serif;max-width:600px">
+  <h2>Thank You, {candidate.get('name')}</h2>
+  <p>While we are not moving forward with your application for
+  <strong>{candidate.get('applied_role', '')}</strong> at this time,
+  we were genuinely impressed by your profile.</p>
+  <p>We have added you to our <strong>Priority Talent Pool</strong>.
+  You will be among the first we contact when a matching role opens.</p>
+  <p>{notes}</p>
+  <p>Thank you for the time you invested in our process.</p>
+  <p>Best regards,<br>HR Team</p>
+</div>
+""")
 
 # ── Run Server ───────────────────────────────────────────────────
 if __name__ == "__main__":

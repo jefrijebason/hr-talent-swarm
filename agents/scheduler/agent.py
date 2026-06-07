@@ -341,16 +341,32 @@ def _send_interviewer_invite(candidate: dict,
 
     meeting_section = ""
     if meeting_url:
-        meeting_section = f"""
-<p><a href="{meeting_url}"
-   style="display:inline-block;background:#6366f1;color:#fff;
-   padding:12px 24px;text-decoration:none;border-radius:8px;
-   font-weight:bold">Join Teams Meeting →</a></p>
-"""
+            meeting_section = f"""
+    <p><a href="{meeting_url}"
+    style="display:inline-block;background:#6366f1;color:#fff;
+    padding:12px 24px;text-decoration:none;border-radius:8px;
+    font-weight:bold">Join Teams Meeting →</a></p>
+    """
     else:
-        meeting_section = """
-<p>A calendar invite with the Teams meeting link will follow shortly.</p>
-"""
+            meeting_section = """
+    <p>A calendar invite with the Teams meeting link will follow shortly.</p>
+    """
+
+    if interview_type == "hr":
+            decision_url = f"http://localhost:8000/hr/decision/{candidate.get('id','')}"
+            meeting_section += f"""
+    <div style="margin-top:16px;padding:16px;background:#f8fafc;
+    border-radius:10px;border:1px solid #e2e8f0">
+    <p style="font-weight:700;color:#374151;margin:0 0 8px">
+        After the HR interview:
+    </p>
+    <a href="{decision_url}"
+        style="display:inline-block;background:#6366f1;color:#fff;
+        padding:12px 28px;text-decoration:none;border-radius:8px;
+        font-weight:bold">
+        📋 Submit Decision (Offer / Decline / Talent Pool) →
+    </a>
+    </div>"""
 
     focus_html = "".join(f"<li>{f}</li>" for f in focus_on[:5]) if focus_on else "<li>Technical depth and culture fit</li>"
     skip_html = "".join(f"<li>{s}</li>" for s in do_not_test[:5]) if do_not_test else "<li>Basic skills already verified by AI</li>"

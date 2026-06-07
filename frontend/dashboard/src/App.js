@@ -1002,7 +1002,7 @@ export default function App() {
           { key: 'pipeline',     icon: '📊', label: 'Pipeline'     },
           { key: 'interviewers', icon: '👥', label: 'Interviewers' },
           { key: 'feed',         icon: '⚡', label: 'Agent Feed'   },
-          { key: 'analytics',    icon: '📈', label: 'Analytics'    },
+          // { key: 'analytics',    icon: '📈', label: 'Analytics'    },
           { key: 'talent',       icon: '⭐', label: 'Talent Pool'  },
         ].map(item => (
           <div key={item.key}

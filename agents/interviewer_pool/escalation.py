@@ -462,7 +462,7 @@ def handle_acceptance(assignment_id: str) -> bool:
             })
 
     print(f"[PIS] Accepted by {interviewer_name}. Meeting: {slot_human}")
-    return True*
+    return True
 
 def _notify_skipped_interviewer(assignment: dict, level: int):
     """Politely notify interviewer they were skipped."""
