@@ -43,5 +43,5 @@ class Config:
     DEMO_MODE                   = os.getenv("DEMO_MODE", "false").lower() == "true"
 
 config = Config()
-
+ACTION_SECRET = os.getenv("ACTION_SECRET", "hr-swarm-secret-2026")
 PUBLIC_URL: str = os.getenv("PUBLIC_URL", "http://localhost:8000")

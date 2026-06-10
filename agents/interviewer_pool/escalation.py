@@ -10,6 +10,7 @@ from shared.cosmos_client import (
 )
 from shared.openai_client import ask_gpt4o_mini, parse_json
 from shared.config import config
+from shared.tokens import generate_token
 from agents.communicator.agent import send_email
 from datetime import datetime, timedelta
 import uuid
@@ -148,8 +149,8 @@ Return ONLY valid JSON:
                 "status":      "invited",
                 "assigned_at": datetime.utcnow().isoformat()
             })
-            log_agent("INTERVIEWER_POOL", "accepted",
-              f"{interviewer_name} accepted the interview", assignment["candidate_id"])
+            log_agent("INTERVIEWER_POOL", "invitation_sent",
+  f"Invitation sent to {interviewer['name']}", assignment["candidate_id"])
             add_assignment_timeline(
                 assignment_id, "invitation_sent",
                 f"Email sent to {interviewer['name']} ({interviewer['email']})"
@@ -192,8 +193,8 @@ def check_and_escalate(assignment_id: str) -> dict:
         return _escalate_to_backup2(assignment_id, assignment)
     elif level == 2:
         return _alert_hr(assignment_id, assignment)
-        log_agent("INTERVIEWER_POOL", "hr_alerted",
-              f"All interviewers unavailable — HR alerted", assignment["candidate_id"])
+        log_agent("INTERVIEWER_POOL", "invitation_sent",
+  f"Invitation sent to {interviewer['name']}", assignment["candidate_id"])
     else:
         return {"status": "max_escalation_reached"}
 
@@ -361,8 +362,11 @@ def handle_custom_assign(assignment_id: str,
     candidate  = get_candidate(assignment["candidate_id"])
 
     base_url    = _base_url()
-    accept_url  = f"{base_url}/api/assignments/{assignment_id}/accept"
-    decline_url = f"{base_url}/api/assignments/{assignment_id}/decline"
+
+    accept_token  = generate_token("accept",  assignment_id)
+    decline_token = generate_token("decline", assignment_id)
+    accept_url    = f"{base_url}/api/assignments/{assignment_id}/accept?token={accept_token}"
+    decline_url   = f"{base_url}/api/assignments/{assignment_id}/decline?token={decline_token}"
 
     prompt = f"""
 Write a personal interview invitation email.

@@ -1,38 +1,1412 @@
-.App {
-  text-align: center;
+/**
+ * HR Swarm — Mission Control  (App.js)
+ * Drop-in replacement for frontend/dashboard/src/App.js
+ *
+ * • Dark design system injected on mount (matches dashboard-prototype.html exactly)
+ * • RequisitionsView   — fully wired to GET/POST /api/jobs
+ * • PipelineView       — preserved, dark-adapted from original
+ * • InterviewerPoolView — preserved as-is from original
+ * • Agent Feed / Talent Reserve / Analytics — dark placeholders
+ *
+ * NOTE: App.css can be emptied — all styles live in DESIGN_CSS below.
+ */
+
+import React, { useState, useEffect, useCallback, useRef } from 'react';
+import axios from 'axios';
+import PipelineView  from './PipelineView';
+import AgentFeedView from './AgentFeedView';
+import AnalyticsView from './AnalyticsView';
+
+const API_URL = process.env.REACT_APP_API_URL || 'http://localhost:8000';
+
+/* ─── pipeline status columns ────────────────────────────────────── */
+const STATUS_COLUMNS = [
+  { key: 'applied',                     label: 'Applied',       color: '#6db4f0' },
+  { key: 'screened',                    label: 'Screened',      color: '#5b8def' },
+  { key: 'ai_interview_complete',       label: 'AI Interview',  color: '#8f9bff' },
+  { key: 'waiting_technical_interview', label: 'Awaiting Tech', color: '#d8b878' },
+  { key: 'waiting_hr_interview',        label: 'Awaiting HR',   color: '#6db4f0' },
+  { key: 'hired',                       label: 'Hired ✓',       color: '#4ade80' },
+  { key: 'rejected',                    label: 'Rejected',      color: '#e0758a' },
+];
+
+/* ─── tiny helpers ────────────────────────────────────────────────── */
+const daysAgo = dt => {
+  if (!dt) return 'recently';
+  const d = Math.floor((Date.now() - new Date(dt)) / 86_400_000);
+  return d === 0 ? 'today' : d === 1 ? '1d ago' : `${d}d ago`;
+};
+
+const reqId = job => {
+  const raw = job.req_number
+    || (job.id ? String(job.id).replace(/\D/g, '').slice(-4).padStart(4, '0') : '0000');
+  return `REQ-${raw}`;
+};
+
+const isActive = j => !j.status || j.status === 'active' || j.status === 'live';
+const isClosed = j => j.status === 'closed' || j.status === 'filled';
+const isDraft  = j => j.status === 'draft';
+
+/* ════════════════════════════════════════════════════════════════════
+   DESIGN SYSTEM CSS
+   Injected once via useEffect — mirrors dashboard-prototype.html exactly
+════════════════════════════════════════════════════════════════════ */
+const DESIGN_CSS = `
+@import url('https://fonts.googleapis.com/css2?family=Bricolage+Grotesque:opsz,wght@12..96,400;12..96,500;12..96,600;12..96,700;12..96,800&family=JetBrains+Mono:wght@400;500;600;700&family=Sora:wght@300;400;500;600&display=swap');
+
+:root {
+  --ob:   #080b12;  --ob2:  #0d121d;
+  --pan:  #111726;  --pan2: #172033;
+  --ln:   rgba(255,255,255,0.06);
+  --ln2:  rgba(255,255,255,0.11);
+  --tx:   #eaeef6;  --tx2:  #92a0ba;  --tx3:  #5a667e;
+  --jd:   #5b8def;  --jdim: #16264a;
+  --cy:   #6db4f0;  --am:   #d8b878;
+  --rs:   #e0758a;  --vi:   #8f9bff;
+}
+*,*::before,*::after { box-sizing:border-box; margin:0; padding:0; }
+html,body,#root { height:100%; overflow:hidden; }
+body {
+  font-family:'Sora',sans-serif;
+  background:var(--ob); color:var(--tx);
+  -webkit-font-smoothing:antialiased;
 }
 
-.App-logo {
-  height: 40vmin;
-  pointer-events: none;
+/* ambient mesh */
+.hs-root::before {
+  content:''; position:fixed; inset:0; z-index:0; pointer-events:none;
+  background:
+    radial-gradient(800px 500px at 12% 8%,  rgba(91,141,239,.10),transparent 60%),
+    radial-gradient(700px 600px at 92% 90%, rgba(109,180,240,.06),transparent 55%),
+    radial-gradient(500px 400px at 80% 10%, rgba(143,155,255,.05),transparent 60%);
+}
+.hs-root::after {
+  content:''; position:fixed; inset:0; z-index:0; pointer-events:none; opacity:.025;
+  background-image:
+    linear-gradient(var(--ln) 1px,transparent 1px),
+    linear-gradient(90deg,var(--ln) 1px,transparent 1px);
+  background-size:48px 48px;
 }
 
-@media (prefers-reduced-motion: no-preference) {
-  .App-logo {
-    animation: App-logo-spin infinite 20s linear;
-  }
+/* keyframes */
+@keyframes hs-rise {
+  from { opacity:0; transform:translateY(16px); }
+  to   { opacity:1; transform:translateY(0); }
+}
+@keyframes hs-pulse {
+  0%   { box-shadow:0 0 0 0 rgba(91,141,239,.5); }
+  70%  { box-shadow:0 0 0 8px rgba(91,141,239,0); }
+  100% { box-shadow:0 0 0 0 rgba(91,141,239,0); }
 }
 
-.App-header {
-  background-color: #282c34;
-  min-height: 100vh;
-  display: flex;
-  flex-direction: column;
-  align-items: center;
-  justify-content: center;
-  font-size: calc(10px + 2vmin);
-  color: white;
+/* rise utility */
+.hs-rise  { animation:hs-rise .6s cubic-bezier(.2,.8,.2,1) both; }
+.hs-d1{animation-delay:.05s} .hs-d2{animation-delay:.10s}
+.hs-d3{animation-delay:.15s} .hs-d4{animation-delay:.20s} .hs-d5{animation-delay:.25s}
+
+/* pulse dot */
+.hs-dot {
+  width:7px; height:7px; border-radius:50%;
+  background:var(--jd); animation:hs-pulse 2s infinite;
 }
 
-.App-link {
-  color: #61dafb;
+/* scrollbar */
+.hs-scr::-webkit-scrollbar { width:9px; }
+.hs-scr::-webkit-scrollbar-thumb { background:var(--pan2); border-radius:9px; }
+.hs-scr2::-webkit-scrollbar { width:8px; }
+.hs-scr2::-webkit-scrollbar-thumb { background:var(--pan2); border-radius:8px; }
+
+/* nav item */
+.hs-nav {
+  display:flex; align-items:center; gap:12px; padding:11px 12px;
+  border-radius:11px; color:var(--tx2); font-size:14px; cursor:pointer;
+  transition:all .18s; margin-bottom:2px; border:1px solid transparent;
+  position:relative;
+}
+.hs-nav:hover { background:var(--pan); color:var(--tx); }
+.hs-nav.on {
+  background:linear-gradient(100deg,rgba(91,141,239,.14),rgba(91,141,239,.02));
+  color:var(--tx); border-color:rgba(91,141,239,.22);
+}
+.hs-nav.on::before {
+  content:''; position:absolute; left:0; top:50%; transform:translateY(-50%);
+  width:3px; height:18px; border-radius:0 3px 3px 0; background:var(--jd);
 }
 
-@keyframes App-logo-spin {
-  from {
-    transform: rotate(0deg);
-  }
-  to {
-    transform: rotate(360deg);
-  }
+/* tab */
+.hs-tab {
+  padding:9px 20px; border-radius:9px; font-size:13px; font-weight:500;
+  color:var(--tx2); cursor:pointer; transition:all .18s;
+  display:flex; align-items:center; gap:8px;
+}
+.hs-tab.on { background:var(--pan2)!important; color:var(--tx)!important; }
+
+/* primary button */
+.hs-btn {
+  display:flex; align-items:center; gap:9px; font-family:'Sora'; font-weight:600;
+  font-size:14px; color:#fff;
+  background:linear-gradient(135deg,var(--jd),#3f6fd1);
+  border:none; border-radius:12px; padding:13px 22px; cursor:pointer;
+  box-shadow:0 8px 28px -8px rgba(91,141,239,.6); transition:all .2s;
+}
+.hs-btn:hover { transform:translateY(-2px); box-shadow:0 14px 36px -8px rgba(91,141,239,.7); }
+.hs-btn:disabled { opacity:.5; cursor:not-allowed; transform:none!important; }
+
+/* icon button */
+.hs-ico {
+  width:38px; height:38px; border-radius:10px; border:1px solid var(--ln);
+  background:var(--pan); display:grid; place-items:center; cursor:pointer;
+  font-size:15px; color:var(--tx2); transition:all .18s;
+}
+.hs-ico:hover { color:var(--tx); border-color:var(--ln2); }
+
+/* requisition card */
+.hs-rc {
+  background:linear-gradient(160deg,var(--pan),var(--ob2));
+  border:1px solid var(--ln); border-radius:18px; padding:22px;
+  transition:border-color .22s,transform .22s; position:relative; overflow:hidden;
+}
+.hs-rc:hover { border-color:var(--ln2); transform:translateY(-3px); }
+.hs-rc::after {
+  content:''; position:absolute; inset:0; border-radius:18px; padding:1px;
+  background:linear-gradient(160deg,rgba(91,141,239,.3),transparent 40%);
+  -webkit-mask:linear-gradient(#000 0 0) content-box,linear-gradient(#000 0 0);
+  -webkit-mask-composite:xor; mask-composite:exclude; opacity:0; transition:.22s;
+  pointer-events:none;
+}
+.hs-rc:hover::after { opacity:1; }
+
+/* req action button */
+.hs-ra {
+  flex:1; text-align:center; font-size:13px; font-weight:500;
+  padding:10px; border-radius:10px; cursor:pointer; transition:all .18s;
+  border:1px solid var(--ln); background:var(--pan2); color:var(--tx2);
+}
+.hs-ra:hover { color:var(--tx); border-color:var(--ln2); }
+.hs-ra.p { background:rgba(91,141,239,.1); color:var(--jd); border-color:rgba(91,141,239,.2); }
+.hs-ra.p:hover { background:rgba(91,141,239,.2); }
+.hs-ra:active { transform:scale(0.97); opacity:0.85; }
+.hs-ra.d:hover { color:var(--rs)!important; border-color:rgba(255,107,129,.3)!important; }
+
+/* toggle switch */
+.hs-sw {
+  width:42px; height:24px; border-radius:100px;
+  background:var(--pan2); border:1px solid var(--ln2);
+  cursor:pointer; position:relative; transition:.2s; flex-shrink:0;
+}
+.hs-sw.on { background:var(--jd); border-color:var(--jd); }
+.hs-sw::after {
+  content:''; position:absolute; top:2px; left:2px;
+  width:18px; height:18px; border-radius:50%; background:#fff; transition:.2s;
+}
+.hs-sw.on::after { transform:translateX(18px); }
+
+/* form inputs */
+.hs-inp, .hs-txa {
+  width:100%; background:var(--pan); border:1px solid var(--ln);
+  border-radius:11px; padding:12px 14px; color:var(--tx);
+  font-family:'Sora'; font-size:14px; outline:none;
+  transition:border-color .18s, background .18s;
+}
+.hs-inp:focus, .hs-txa:focus { border-color:rgba(91,141,239,.4); background:var(--pan2); }
+.hs-inp::placeholder, .hs-txa::placeholder { color:var(--tx3); }
+.hs-txa { resize:vertical; min-height:90px; line-height:1.6; }
+
+/* dropzone */
+.hs-drop {
+  border:1.5px dashed var(--ln2); border-radius:12px; padding:22px;
+  text-align:center; color:var(--tx3); font-size:13px;
+  cursor:pointer; transition:all .18s;
+}
+.hs-drop:hover { border-color:rgba(91,141,239,.4); color:var(--tx2); background:var(--pan); }
+
+/* pipeline kanban */
+.hs-kol {
+  background:linear-gradient(160deg,var(--pan),var(--ob2));
+  border:1px solid var(--ln); border-radius:12px;
+  padding:12px; min-height:200px; min-width:158px;
+}
+.hs-ccard {
+  background:var(--pan2); border:1px solid var(--ln); border-radius:10px;
+  padding:12px; margin-bottom:8px; cursor:pointer; transition:border-color .15s;
+}
+.hs-ccard:hover { border-color:var(--ln2); }
+
+/* overlay / panel */
+.hs-overlay {
+  position:fixed; inset:0; background:rgba(3,5,8,.7);
+  backdrop-filter:blur(4px); z-index:50;
+  transition:opacity .3s;
+}
+`;
+
+/* ════════════════════════════════════════════════════════════════════
+   SHARED FORM STYLES  (for ValidatedInput / InterviewerPoolView)
+════════════════════════════════════════════════════════════════════ */
+const fld = {
+  label:      { fontSize:13, fontWeight:600, color:'#374151', display:'block', marginBottom:6 },
+  smallLabel: { fontSize:11, fontWeight:600, color:'#6b7280', display:'block', marginBottom:4 },
+  input:      { width:'100%', padding:'10px 12px', borderRadius:8, border:'1.5px solid #e2e8f0',
+                fontSize:14, boxSizing:'border-box', outline:'none', fontFamily:'inherit' },
+  smallInput: { width:'100%', padding:'8px 10px', borderRadius:6, border:'1px solid #e2e8f0',
+                fontSize:13, boxSizing:'border-box' },
+  iconBtn:    { background:'#f1f5f9', border:'1px solid #e2e8f0', borderRadius:6,
+                padding:'4px 8px', cursor:'pointer', fontSize:14, color:'#475569' },
+  errorText:  { fontSize:11, color:'#dc2626', marginTop:4 },
+};
+
+/* ─── ValidatedInput (used by InterviewerPoolView) ────────────────── */
+function ValidatedInput({ label, fieldKey, form, setForm, errors, setErrors,
+  placeholder, type = 'text', min, max, required }) {
+  const hasError = !!errors[fieldKey];
+  return (
+    <div>
+      <label style={fld.smallLabel}>{label}{required && ' *'}</label>
+      <input
+        style={{ ...fld.smallInput,
+          borderColor: hasError ? '#dc2626' : '#e2e8f0',
+          background:  hasError ? '#fef2f2' : '#fff' }}
+        type={type} min={min} max={max} placeholder={placeholder}
+        value={form[fieldKey]}
+        onChange={e => {
+          setForm({ ...form, [fieldKey]: e.target.value });
+          if (hasError) setErrors({ ...errors, [fieldKey]: null });
+        }}
+      />
+      {hasError && <div style={fld.errorText}>⚠️ {errors[fieldKey]}</div>}
+    </div>
+  );
+}
+
+/* ════════════════════════════════════════════════════════════════════
+   SWITCH TOGGLE
+════════════════════════════════════════════════════════════════════ */
+function Switch({ on, onToggle }) {
+  return <div className={`hs-sw${on ? ' on' : ''}`} onClick={onToggle} />;
+}
+
+/* ════════════════════════════════════════════════════════════════════
+   NEW REQUISITION DRAWER
+════════════════════════════════════════════════════════════════════ */
+function NewRequisitionDrawer({ open, onClose, onPublished }) {
+  const INIT = {
+    title:'', department:'', location:'Bangalore (Hybrid)',
+    salMin:'', salMax:'', jdText:'',
+    knowledgeBase:'', interviewDirection:'',
+    resumeAdaptive: true, codingEnabled: true, multiLang: false,
+  };
+  const [form, setForm]       = useState(INIT);
+  const [loading, setLoading] = useState(false);
+
+  const set = (k, v) => setForm(f => ({ ...f, [k]: v }));
+
+  const handlePublish = async () => {
+    if (!form.title.trim() || loading) return;
+    setLoading(true);
+    try {
+      const res = await axios.post(`${API_URL}/api/jobs`, {
+        title:               form.title.trim(),
+        department:          form.department.trim(),
+        location:            form.location.trim(),
+        salary_min:          form.salMin,
+        salary_max:          form.salMax,
+        jd_text:             form.jdText,
+        interview_mode:      'standard',
+        ai_interview_enabled: true,
+        coding_enabled:      form.codingEnabled,
+        knowledge_base:      form.knowledgeBase,
+        interview_direction: form.interviewDirection,
+        resume_adaptive:     form.resumeAdaptive,
+        multi_lang:          form.multiLang,
+      });
+      onPublished(res.data?.job || res.data);
+    } catch (err) {
+      console.error('POST /api/jobs', err);
+      onPublished(null); // trigger refresh even on error
+    }
+    setLoading(false);
+    setForm(INIT);
+    onClose();
+  };
+
+  const toggles = [
+    { label: 'Resume-adaptive questions', k: 'resumeAdaptive' },
+    { label: 'Enable coding assessment',  k: 'codingEnabled' },
+    { label: 'Multi-language support',    k: 'multiLang' },
+  ];
+
+  return (
+    <>
+      {/* overlay */}
+      <div
+        className="hs-overlay"
+        style={{ opacity: open ? 1 : 0, pointerEvents: open ? 'auto' : 'none' }}
+        onClick={onClose}
+      />
+
+      {/* drawer */}
+      <div style={{
+        position:'fixed', top:0, right:0, height:'100vh',
+        width:560, maxWidth:'92vw', zIndex:51,
+        background:'linear-gradient(180deg,var(--ob2),var(--ob))',
+        borderLeft:'1px solid var(--ln2)',
+        transform: open ? 'translateX(0)' : 'translateX(100%)',
+        transition:'transform .34s cubic-bezier(.3,.9,.3,1)',
+        display:'flex', flexDirection:'column',
+        boxShadow:'-30px 0 80px -20px rgba(0,0,0,.6)',
+      }}>
+        {/* head */}
+        <div style={{
+          padding:'26px 28px', borderBottom:'1px solid var(--ln)',
+          display:'flex', justifyContent:'space-between', alignItems:'flex-start',
+        }}>
+          <div>
+            <div style={{ fontFamily:'Bricolage Grotesque', fontWeight:800,
+              fontSize:24, letterSpacing:'-0.02em' }}>
+              New Requisition
+            </div>
+            <div style={{ color:'var(--tx2)', fontSize:13, marginTop:5 }}>
+              Define the role and configure the AI interview
+            </div>
+          </div>
+          <div className="hs-ico" onClick={onClose}>✕</div>
+        </div>
+
+        {/* body */}
+        <div className="hs-scr2" style={{ flex:1, overflowY:'auto', padding:'26px 28px' }}>
+
+          {/* Role Title */}
+          <Field label="Role Title">
+            <input className="hs-inp" placeholder="e.g. Senior AI Engineer"
+              value={form.title} onChange={e => set('title', e.target.value)} />
+          </Field>
+
+          {/* Dept + Location */}
+          <div style={{ display:'grid', gridTemplateColumns:'1fr 1fr', gap:14 }}>
+            <Field label="Department">
+              <input className="hs-inp" placeholder="Engineering"
+                value={form.department} onChange={e => set('department', e.target.value)} />
+            </Field>
+            <Field label="Location">
+              <input className="hs-inp" placeholder="Bangalore (Hybrid)"
+                value={form.location} onChange={e => set('location', e.target.value)} />
+            </Field>
+          </div>
+
+          {/* Salary */}
+          <div style={{ display:'grid', gridTemplateColumns:'1fr 1fr', gap:14 }}>
+            <Field label="Salary Min (LPA)">
+              <input className="hs-inp" placeholder="18"
+                value={form.salMin} onChange={e => set('salMin', e.target.value)} />
+            </Field>
+            <Field label="Salary Max (LPA)">
+              <input className="hs-inp" placeholder="24"
+                value={form.salMax} onChange={e => set('salMax', e.target.value)} />
+            </Field>
+          </div>
+
+          {/* JD */}
+          <Field label="Job Description">
+            <textarea className="hs-txa"
+              placeholder="Requirements, responsibilities, must-have skills..."
+              value={form.jdText} onChange={e => set('jdText', e.target.value)} />
+          </Field>
+
+          {/* ── ARIA AI Box ── */}
+          <div style={{
+            background:'linear-gradient(160deg,rgba(109,180,240,.06),rgba(143,155,255,.04))',
+            border:'1px solid rgba(109,180,240,.18)', borderRadius:14, padding:18,
+            marginBottom:6,
+          }}>
+            <div style={{ display:'flex', alignItems:'center', gap:10, marginBottom:6 }}>
+              <span style={{ fontFamily:'JetBrains Mono', fontSize:9, letterSpacing:'0.12em',
+                textTransform:'uppercase', color:'var(--cy)', fontWeight:600,
+                background:'rgba(109,180,240,.12)', padding:'3px 9px', borderRadius:6 }}>
+                New · AI
+              </span>
+              <span style={{ fontFamily:'Bricolage Grotesque', fontWeight:700, fontSize:16 }}>
+                ARIA Interview Setup
+              </span>
+            </div>
+            <p style={{ fontSize:12, color:'var(--tx2)', lineHeight:1.5, marginBottom:14 }}>
+              Steer how the AI interviewer evaluates candidates for this role. Each candidate
+              gets <strong style={{ color:'var(--jd)' }}>unique resume-adapted questions</strong> — never
+              identical across applicants.
+            </p>
+
+            <Field label="Knowledge Base" optional>
+              <textarea className="hs-txa"
+                placeholder="Company context ARIA should know: tech stack, products, what you value, topics to probe..."
+                value={form.knowledgeBase} onChange={e => set('knowledgeBase', e.target.value)} />
+            </Field>
+
+            <Field label="Attach Document" optional>
+              <div className="hs-drop">⊕ &nbsp;Drop a PDF / DOCX or click to upload</div>
+            </Field>
+
+            <Field label="Custom Interview Direction" optional style={{ marginBottom:6 }}>
+              <textarea className="hs-txa"
+                placeholder="e.g. Focus 70% on system design, 30% leadership. Be challenging on scalability."
+                value={form.interviewDirection} onChange={e => set('interviewDirection', e.target.value)} />
+            </Field>
+
+            {/* toggles */}
+            {toggles.map((t, i) => (
+              <div key={t.k} style={{
+                display:'flex', alignItems:'center', justifyContent:'space-between',
+                padding:'11px 0', borderTop: i === 0 ? 'none' : '1px solid var(--ln)',
+              }}>
+                <span style={{ fontSize:13, color:'var(--tx2)' }}>{t.label}</span>
+                <Switch on={form[t.k]} onToggle={() => set(t.k, !form[t.k])} />
+              </div>
+            ))}
+          </div>
+        </div>
+
+        {/* foot */}
+        <div style={{
+          padding:'20px 28px', borderTop:'1px solid var(--ln)',
+          display:'flex', gap:12,
+        }}>
+          <button style={{
+            padding:'13px 22px', borderRadius:12, background:'var(--pan)',
+            border:'1px solid var(--ln)', color:'var(--tx2)',
+            fontFamily:'Sora', fontWeight:500, fontSize:14, cursor:'pointer',
+          }} onClick={onClose}>
+            Cancel
+          </button>
+          <button
+            className="hs-btn"
+            style={{ flex:1, justifyContent:'center' }}
+            onClick={handlePublish}
+            disabled={!form.title.trim() || loading}
+          >
+            {loading ? '⏳ Publishing...' : 'Publish Requisition'}
+          </button>
+        </div>
+      </div>
+    </>
+  );
+}
+
+/* small helper – labelled field wrapper */
+function Field({ label, optional, children, style: s }) {
+  return (
+    <div style={{ marginBottom:20, ...s }}>
+      <div style={{ fontSize:12, fontWeight:600, color:'var(--tx)',
+        marginBottom:8, display:'flex', alignItems:'center', gap:8 }}>
+        {label}
+        {optional && (
+          <span style={{ fontFamily:'JetBrains Mono', fontSize:9, letterSpacing:'0.1em',
+            textTransform:'uppercase', color:'var(--cy)',
+            background:'rgba(109,180,240,.1)', padding:'2px 7px', borderRadius:5 }}>
+            Optional
+          </span>
+        )}
+      </div>
+      {children}
+    </div>
+  );
+}
+
+/* ════════════════════════════════════════════════════════════════════
+   REQUISITIONS VIEW  ← Main delivery, wired to /api/jobs
+════════════════════════════════════════════════════════════════════ */
+function RequisitionsView({ jobs, candidates, onRefresh, onNavigatePipeline }) {
+  const [tab, setTab]           = useState('active');
+  const [drawerOpen, setDrawer] = useState(false);
+  const [localStatus, setLocalStatus] = useState({});
+  const [selectionMode, setSelectionMode] = useState(false);
+  const [selectedIds,   setSelectedIds]   = useState(new Set());
+  const [confirmDel,    setConfirmDel]    = useState(false);
+  const [deleting,      setDeleting]      = useState(false);
+  const [deletedIds,    setDeletedIds]    = useState(new Set());
+
+  const toggleSelect = (jobId) => {
+    setSelectedIds(prev => {
+      const next = new Set(prev);
+      if (next.has(jobId)) next.delete(jobId); else next.add(jobId);
+      return next;
+    });
+  };
+
+  const clearSelection = () => {
+    setSelectionMode(false);
+    setSelectedIds(new Set());
+  };
+
+  const handleDelete = async () => {
+    setDeleting(true);
+    const ids = Array.from(selectedIds);
+    setDeletedIds(prev => new Set([...prev, ...ids])); // hide instantly
+    try {
+      await Promise.allSettled(ids.map(id =>
+        axios.delete(`${API_URL}/api/jobs/${id}`)
+      ));
+    } catch {}
+    setDeleting(false);
+    setConfirmDel(false);
+    clearSelection();
+    onRefresh();
+  };
+
+  const handleClose = async job => {
+    setLocalStatus(prev => ({ ...prev, [job.id]: 'closed' }));
+    try {
+      await axios.patch(`${API_URL}/api/jobs/${job.id}`, { status: 'closed' });
+    } catch {}
+    onRefresh();
+  };
+
+  const handleReopen = async job => {
+    setLocalStatus(prev => ({ ...prev, [job.id]: 'active' }));
+    try {
+      await axios.patch(`${API_URL}/api/jobs/${job.id}`, { status: 'active' });
+    } catch {}
+    onRefresh();
+  };
+
+  const jobsWithLocalStatus = jobs
+    .filter(j => !deletedIds.has(j.id))
+    .map(j => localStatus[j.id] ? { ...j, status: localStatus[j.id] } : j);
+
+  /* funnel stats for a single job */
+  const funnel = job => {
+    const cs = candidates.filter(c =>
+      c.job_id === job.id || c.applied_role === job.title
+    );
+    return {
+      applied:      cs.length,
+      inProcess:    cs.filter(c =>
+        ['screened','ai_interview_complete','waiting_technical_interview','waiting_hr_interview']
+          .includes(c.status)).length,
+      interviewing: cs.filter(c =>
+        ['waiting_technical_interview','waiting_hr_interview'].includes(c.status)).length,
+      hired:        cs.filter(c => c.status === 'hired').length,
+    };
+  };
+
+  const active = jobsWithLocalStatus.filter(isActive);
+  const closed = jobsWithLocalStatus.filter(isClosed);
+  const drafts = jobsWithLocalStatus.filter(isDraft);
+  const shown  = tab === 'active' ? active : tab === 'closed' ? closed : drafts;
+
+  /* global stats */
+  const totalApplicants = candidates.length;
+  const inPipeline      = candidates.filter(c => !['hired','rejected'].includes(c.status)).length;
+  const offersSent      = candidates.filter(c => c.status === 'waiting_hr_interview').length;
+
+  const STATS = [
+    { val: active.length,    lbl:'Active Requisitions', ico:'◫', color:'var(--jd)' },
+    { val: totalApplicants,  lbl:'Total Applicants',    ico:'⊞', color:'var(--cy)' },
+    { val: inPipeline,       lbl:'In Pipeline',         ico:'◎', color:'var(--am)' },
+    { val: offersSent,       lbl:'Offers Sent',         ico:'◉', color:'var(--vi)' },
+    { val: '$31',            lbl:'AI Compute (mo)',     ico:'⚡', color:'var(--jd)' },
+  ];
+
+  const TABS = [
+    { k:'active', lbl:'Active', n: active.length },
+    { k:'closed', lbl:'Closed', n: closed.length },
+    { k:'drafts', lbl:'Drafts', n: drafts.length },
+  ];
+
+  return (
+    <div style={{ position:'relative', zIndex:1 }}>
+      <NewRequisitionDrawer
+        open={drawerOpen}
+        onClose={() => setDrawer(false)}
+        onPublished={() => { setDrawer(false); onRefresh(); }}
+      />
+
+      {/* ── Page Head ── */}
+      <div className="hs-rise" style={{
+        display:'flex', alignItems:'flex-end', justifyContent:'space-between',
+        marginBottom:26,
+      }}>
+        <div>
+          <h1 style={{
+            fontFamily:'Bricolage Grotesque', fontWeight:800, fontSize:34,
+            letterSpacing:'-0.03em', lineHeight:1,
+          }}>Requisitions</h1>
+          <p style={{ color:'var(--tx2)', fontSize:14, marginTop:8 }}>
+            Open hiring requests across your{' '}
+            <span style={{ color:'var(--jd)' }}>organization</span>
+          </p>
+        </div>
+        <button className="hs-btn" onClick={() => setDrawer(true)}>
+          ＋ New Requisition
+        </button>
+      </div>
+
+      {/* ── Stat Strip ── */}
+      <div style={{
+        display:'grid', gridTemplateColumns:'repeat(5,1fr)', gap:14, marginBottom:28,
+      }}>
+        {STATS.map((s, i) => (
+          <div key={s.lbl}
+            className={`hs-rise hs-d${i + 1}`}
+            style={{
+              background:'linear-gradient(160deg,var(--pan),var(--ob2))',
+              border:'1px solid var(--ln)', borderRadius:16,
+              padding:'18px 20px', position:'relative', overflow:'hidden',
+            }}
+          >
+            <div style={{
+              fontFamily:'JetBrains Mono', fontWeight:700, fontSize:30,
+              letterSpacing:'-0.02em', color: s.color,
+            }}>{s.val}</div>
+            <div style={{ fontSize:12, color:'var(--tx2)', marginTop:5 }}>{s.lbl}</div>
+            <div style={{ position:'absolute', right:-10, bottom:-10,
+              fontSize:54, opacity:.05, pointerEvents:'none' }}>{s.ico}</div>
+          </div>
+        ))}
+      </div>
+
+      {/* ── Tabs + Closed-tab selection toolbar ── */}
+      <div style={{ display:'flex', alignItems:'center', justifyContent:'space-between', marginBottom:22, gap:14, flexWrap:'wrap' }}>
+        <div style={{ display:'flex', gap:6, background:'var(--pan)',
+          border:'1px solid var(--ln)', borderRadius:12, padding:5, width:'fit-content' }}>
+          {TABS.map(t => (
+            <div key={t.k}
+              className={`hs-tab${tab === t.k ? ' on' : ''}`}
+              onClick={() => { setTab(t.k); clearSelection(); }}
+            >
+              {t.lbl}
+              <span style={{
+                fontFamily:'JetBrains Mono', fontSize:11,
+                color: tab === t.k ? 'var(--jd)' : 'var(--tx3)',
+              }}>{t.n}</span>
+            </div>
+          ))}
+        </div>
+
+        {tab === 'closed' && closed.length > 0 && (
+          <div style={{ display:'flex', alignItems:'center', gap:10 }}>
+            {!selectionMode ? (
+              <button onClick={() => setSelectionMode(true)}
+                style={{ padding:'10px 16px', borderRadius:10, cursor:'pointer',
+                  background:'var(--pan)', border:'1px solid var(--ln)',
+                  color:'var(--tx2)', fontFamily:'Sora', fontWeight:600, fontSize:13 }}>
+                🗑  Select to Delete
+              </button>
+            ) : (
+              <>
+                <span style={{ fontFamily:'JetBrains Mono', fontSize:12, color:'var(--tx2)' }}>
+                  {selectedIds.size} selected
+                </span>
+                <button onClick={clearSelection}
+                  style={{ padding:'10px 16px', borderRadius:10, cursor:'pointer',
+                    background:'var(--pan)', border:'1px solid var(--ln)',
+                    color:'var(--tx2)', fontFamily:'Sora', fontWeight:600, fontSize:13 }}>
+                  Cancel
+                </button>
+                <button
+                  onClick={() => selectedIds.size > 0 && setConfirmDel(true)}
+                  disabled={selectedIds.size === 0}
+                  style={{ padding:'10px 18px', borderRadius:10,
+                    cursor: selectedIds.size === 0 ? 'not-allowed' : 'pointer',
+                    background: selectedIds.size === 0 ? 'var(--pan)' : 'rgba(224,117,138,.15)',
+                    border: `1px solid ${selectedIds.size === 0 ? 'var(--ln)' : 'rgba(224,117,138,.4)'}`,
+                    color: selectedIds.size === 0 ? 'var(--tx3)' : 'var(--rs)',
+                    fontFamily:'Sora', fontWeight:700, fontSize:13 }}>
+                  Delete Selected ({selectedIds.size})
+                </button>
+              </>
+            )}
+          </div>
+        )}
+      </div>
+
+      {/* ── Confirmation Dialog ── */}
+      {confirmDel && (
+        <>
+          <div style={{ position:'fixed', inset:0, background:'rgba(3,5,8,.7)',
+            backdropFilter:'blur(4px)', zIndex:60 }} onClick={() => !deleting && setConfirmDel(false)} />
+          <div style={{
+            position:'fixed', top:'50%', left:'50%', transform:'translate(-50%,-50%)',
+            background:'linear-gradient(160deg,var(--ob2),var(--ob))',
+            border:'1px solid var(--ln2)', borderRadius:18,
+            padding:'28px 30px', width:440, maxWidth:'90vw', zIndex:61,
+            boxShadow:'0 30px 80px -20px rgba(0,0,0,.8)',
+          }}>
+            <div style={{ display:'flex', alignItems:'center', gap:14, marginBottom:14 }}>
+              <div style={{ width:42, height:42, borderRadius:'50%',
+                background:'rgba(224,117,138,.15)', display:'grid', placeItems:'center',
+                fontSize:20 }}>⚠️</div>
+              <div>
+                <div style={{ fontFamily:'Bricolage Grotesque', fontWeight:800,
+                  fontSize:18, letterSpacing:'-0.02em' }}>
+                  Delete {selectedIds.size} requisition{selectedIds.size > 1 ? 's' : ''}?
+                </div>
+              </div>
+            </div>
+            <p style={{ color:'var(--tx2)', fontSize:13, lineHeight:1.6, marginBottom:20 }}>
+              This will permanently delete the selected closed requisitions from the database.
+              Candidate records will be preserved. <strong style={{ color:'var(--rs)' }}>This action cannot be undone.</strong>
+            </p>
+            <div style={{ display:'flex', gap:10 }}>
+              <button onClick={() => setConfirmDel(false)} disabled={deleting}
+                style={{ flex:1, padding:'12px 18px', borderRadius:10,
+                  cursor: deleting ? 'not-allowed' : 'pointer',
+                  background:'var(--pan)', border:'1px solid var(--ln)',
+                  color:'var(--tx2)', fontFamily:'Sora', fontWeight:600, fontSize:13 }}>
+                Cancel
+              </button>
+              <button onClick={handleDelete} disabled={deleting}
+                style={{ flex:1, padding:'12px 18px', borderRadius:10,
+                  cursor: deleting ? 'not-allowed' : 'pointer',
+                  background:'rgba(224,117,138,.2)', border:'1px solid rgba(224,117,138,.5)',
+                  color:'var(--rs)', fontFamily:'Sora', fontWeight:700, fontSize:13 }}>
+                {deleting ? '⏳ Deleting...' : `🗑 Yes, delete ${selectedIds.size}`}
+              </button>
+            </div>
+          </div>
+        </>
+      )}
+
+      {/* ── Cards Grid ── */}
+      {shown.length === 0 ? (
+        <div style={{
+          textAlign:'center', padding:'60px 20px',
+          color:'var(--tx3)', fontFamily:'JetBrains Mono',
+        }}>
+          <div style={{ fontSize:48, marginBottom:12 }}>◫</div>
+          <p>No {tab} requisitions</p>
+        </div>
+      ) : (
+        <div style={{
+          display:'grid', gap:18,
+          gridTemplateColumns:'repeat(auto-fill,minmax(380px,1fr))',
+        }}>
+          {shown.map((job, i) => {
+            const f   = funnel(job);
+            const act = localStatus[job.id] ? localStatus[job.id] === 'active' : isActive(job);
+            return (
+              <ReqCard key={job.id} job={job} f={f} active={act} delay={i % 5 + 1}
+                onClose={() => handleClose(job)}
+                onReopen={() => handleReopen(job)}
+                onViewPipeline={() => onNavigatePipeline(job.id)}
+                selectionMode={selectionMode && tab === 'closed'}
+                isSelected={selectedIds.has(job.id)}
+                onToggleSelect={() => toggleSelect(job.id)}
+              />
+            );
+          })}
+        </div>
+      )}
+    </div>
+  );
+}
+
+/* ── Requisition Card ─────────────────────────────────────────────── */
+function ReqCard({ job, f, active, delay, onClose, onReopen, onViewPipeline,
+  selectionMode = false, isSelected = false, onToggleSelect }) {
+  const funnelSegs = [
+    { flex: f.applied,      color:'var(--cy)' },
+    { flex: f.inProcess,    color:'var(--jd)' },
+    { flex: f.interviewing, color:'var(--am)' },
+    { flex: f.hired,        color:'var(--vi)' },
+  ];
+  const stats = [
+    { val: f.applied,      lbl:'Applied',      color:'var(--cy)' },
+    { val: f.inProcess,    lbl:'In Process',   color:'var(--jd)' },
+    { val: f.interviewing, lbl:'Interviewing', color:'var(--am)' },
+    { val: f.hired,        lbl:'Hired',        color:'var(--vi)' },
+  ];
+
+  return (
+    <div className={`hs-rc hs-rise hs-d${delay}`}
+      onClick={selectionMode ? onToggleSelect : undefined}
+      style={{
+        cursor: selectionMode ? 'pointer' : 'default',
+        outline: selectionMode && isSelected ? '2px solid var(--rs)' : 'none',
+        outlineOffset: -2,
+      }}>
+      {selectionMode && (
+        <div style={{
+          position:'absolute', top:14, left:14, zIndex:5,
+          width:22, height:22, borderRadius:6,
+          border: `2px solid ${isSelected ? 'var(--rs)' : 'var(--ln2)'}`,
+          background: isSelected ? 'var(--rs)' : 'rgba(0,0,0,.3)',
+          display:'grid', placeItems:'center',
+          fontSize:12, color:'#fff', fontWeight:700,
+          transition:'all .15s',
+        }}>
+          {isSelected ? '✓' : ''}
+        </div>
+      )}
+      {/* top */}
+      <div style={{ display:'flex', justifyContent:'space-between',
+        alignItems:'flex-start', marginBottom:14 }}>
+        <div>
+          <div style={{ fontFamily:'Bricolage Grotesque', fontWeight:700,
+            fontSize:20, letterSpacing:'-0.02em' }}>
+            {job.title}
+          </div>
+          <div style={{ fontSize:12, color:'var(--tx3)', marginTop:4,
+            fontFamily:'JetBrains Mono' }}>
+            {reqId(job)} · {job.location || 'Remote'} · Posted {daysAgo(job.created_at)}
+          </div>
+        </div>
+        {/* status pill */}
+        <div style={{
+          fontFamily:'JetBrains Mono', fontSize:10, letterSpacing:'0.1em',
+          textTransform:'uppercase', padding:'5px 11px', borderRadius:100,
+          display:'flex', alignItems:'center', gap:6, fontWeight:600,
+          flexShrink:0,
+          background: active ? 'var(--jdim)' : 'rgba(224,117,138,.12)',
+          color:      active ? 'var(--jd)'   : 'var(--rs)',
+        }}>
+          <span style={{ width:6, height:6, borderRadius:'50%',
+            background:'currentColor', flexShrink:0 }} />
+          {active ? 'Active' : 'Closed'}
+        </div>
+      </div>
+
+      {/* funnel bar */}
+      <div style={{ display:'flex', borderRadius:10, overflow:'hidden',
+        height:8, marginBottom:14, opacity: active ? 1 : 0.4 }}>
+        {funnelSegs.map((seg, si) => (
+          <div key={si} style={{ flex: seg.flex || 0.1, height:'100%',
+            background: seg.color }} />
+        ))}
+      </div>
+
+      {/* stats row */}
+      <div style={{ display:'flex', gap:18, marginBottom:18,
+        opacity: active ? 1 : 0.6 }}>
+        {stats.map(s => (
+          <div key={s.lbl} style={{ display:'flex', flexDirection:'column' }}>
+            <span style={{ fontFamily:'JetBrains Mono', fontWeight:700,
+              fontSize:19, color: s.color }}>{s.val}</span>
+            <span style={{ fontSize:11, color:'var(--tx3)', marginTop:2 }}>{s.lbl}</span>
+          </div>
+        ))}
+      </div>
+
+      {/* actions */}
+      <div style={{ display:'flex', gap:8,
+        borderTop:'1px solid var(--ln)', paddingTop:16 }}>
+        {selectionMode ? (
+          <div style={{ flex:1, textAlign:'center', fontSize:12,
+            color:'var(--tx3)', fontFamily:'JetBrains Mono', padding:'10px' }}>
+            {isSelected ? 'Marked for deletion' : 'Click card to select'}
+          </div>
+        ) : active ? (
+          <>
+            <div className="hs-ra p" onClick={onViewPipeline}>View Pipeline</div>
+            <div className="hs-ra d" onClick={onClose}>⊘ Close</div>
+          </>
+        ) : (
+          <>
+            <div className="hs-ra p" onClick={onReopen}>↻ Reopen</div>
+          </>
+        )}
+      </div>
+    </div>
+  );
+}
+
+function InterviewerPoolView() {
+  const [interviewers, setInterviewers] = useState([]);
+  const [assignments, setAssignments]   = useState([]);
+  const [showAdd, setShowAdd]           = useState(false);
+  const [loading, setLoading]           = useState(false);
+  const [hrUsers, setHrUsers]           = useState([]);
+  const [formErrors, setFormErrors]     = useState({});
+  const [form, setForm] = useState({
+    name:'', email:'', role:'', department:'',
+    seniority:'senior', skills:'', max_per_week:3, hr_id:'',
+  });
+
+  useEffect(() => {
+    loadData();
+    const t = setInterval(loadData, 5000);
+    return () => clearInterval(t);
+  }, []);
+
+  const loadData = () => {
+    axios.get(`${API_URL}/api/interviewers`).then(r => setInterviewers(r.data.interviewers || [])).catch(() => {});
+    axios.get(`${API_URL}/api/assignments`).then(r => setAssignments(r.data || [])).catch(() => {});
+    axios.get(`${API_URL}/api/hr-users`).then(r => setHrUsers(r.data || [])).catch(() => {});
+  };
+
+  const validateForm = () => {
+    const errs = {};
+    const emailRe = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+    if (!form.name.trim())          errs.name = 'Full name is required';
+    if (!form.email.trim())         errs.email = 'Email address is required';
+    else if (!emailRe.test(form.email.trim())) errs.email = 'Please enter a valid email';
+    if (!form.role.trim())          errs.role = 'Job title is required';
+    if (!form.skills.trim())        errs.skills = 'Please enter at least one skill';
+    const mx = parseInt(form.max_per_week);
+    if (isNaN(mx) || mx < 1 || mx > 10) errs.max_per_week = 'Must be 1–10';
+    setFormErrors(errs);
+    return Object.keys(errs).length === 0;
+  };
+
+  const handleAdd = async () => {
+    if (!validateForm()) return;
+    setLoading(true);
+    try {
+      const skills = form.skills.split(',').map(s => s.trim()).filter(Boolean);
+      await axios.post(`${API_URL}/api/interviewers`, {
+        name:form.name.trim(), email:form.email.trim(), role:form.role.trim(),
+        department:form.department.trim(), seniority:form.seniority,
+        skills, max_per_week:parseInt(form.max_per_week)||3,
+        hr_id:form.hr_id||hrUsers[0]?.id||'',
+      });
+      setShowAdd(false); setFormErrors({});
+      setForm({ name:'',email:'',role:'',department:'',seniority:'senior',skills:'',max_per_week:3,hr_id:'' });
+      loadData();
+      alert('✅ Invitation sent! Interviewer will receive email to accept.');
+    } catch { alert('Error adding interviewer. Please try again.'); }
+    setLoading(false);
+  };
+
+  const sc = st => ({ active:{bg:'#dcfce7',color:'#16a34a'}, pending:{bg:'#fef9c3',color:'#92400e'},
+    inactive:{bg:'#fee2e2',color:'#dc2626'} }[st]||{bg:'#f1f5f9',color:'#475569'});
+
+  const pisAlerts = assignments.filter(a => a.status === 'hr_action_required');
+
+  return (
+    <div>
+      {pisAlerts.length > 0 && (
+        <div style={{ background:'rgba(224,117,138,.1)', border:'1px solid rgba(224,117,138,.3)',
+          borderRadius:12, padding:16, marginBottom:20 }}>
+          <div style={{ fontWeight:700, color:'var(--rs)', marginBottom:8 }}>
+            🚨 PIS Alerts — Action Required ({pisAlerts.length})
+          </div>
+          {pisAlerts.map(a => (
+            <div key={a.id} style={{ fontSize:13, color:'var(--tx2)', marginBottom:4 }}>
+              ⚠️ Candidate {a.candidate_id?.slice(0,8)} — All interviewers unresponsive. HR action needed.
+            </div>
+          ))}
+        </div>
+      )}
+
+      <div style={{ display:'flex', justifyContent:'space-between', alignItems:'center', marginBottom:20 }}>
+        <div>
+          <h3 style={{ margin:'0 0 4px', color:'var(--tx)', fontFamily:'Bricolage Grotesque', fontWeight:700 }}>
+            Interviewer Pool
+          </h3>
+          <p style={{ margin:0, fontSize:13, color:'var(--tx2)' }}>
+            {interviewers.filter(i => i.status==='active').length} active ·{' '}
+            {interviewers.filter(i => i.status==='pending').length} pending ·{' '}
+            {interviewers.filter(i => i.status==='active' && i.current_booked < i.max_per_week).length} available now
+          </p>
+        </div>
+        <button onClick={() => setShowAdd(!showAdd)}
+          style={{ padding:'10px 20px', background:'linear-gradient(135deg,var(--jd),#3f6fd1)',
+            color:'#fff', border:'none', borderRadius:10, cursor:'pointer', fontWeight:700 }}>
+          + Add Interviewer
+        </button>
+      </div>
+
+      {showAdd && (
+        <div style={{ background:'var(--pan2)', border:'1px solid var(--ln)',
+          borderRadius:14, padding:20, marginBottom:20 }}>
+          <h4 style={{ margin:'0 0 4px', color:'var(--tx)' }}>Add New Interviewer</h4>
+          <p style={{ fontSize:13, color:'var(--tx2)', marginBottom:16 }}>
+            An invitation email will be sent. They join the pool once they accept.
+          </p>
+          <div style={{ display:'grid', gridTemplateColumns:'1fr 1fr', gap:12 }}>
+            <ValidatedInput label="Full Name" fieldKey="name" required form={form} setForm={setForm} errors={formErrors} setErrors={setFormErrors} placeholder="Vikram Nair" />
+            <ValidatedInput label="Email Address" fieldKey="email" required form={form} setForm={setForm} errors={formErrors} setErrors={setFormErrors} placeholder="vikram@company.com" type="email" />
+            <ValidatedInput label="Job Title" fieldKey="role" required form={form} setForm={setForm} errors={formErrors} setErrors={setFormErrors} placeholder="Senior AI Engineer" />
+            <div>
+              <label style={{ ...fld.smallLabel, color:'var(--tx2)' }}>Department</label>
+              <input style={{ ...fld.smallInput, background:'var(--pan)', border:'1px solid var(--ln)', color:'var(--tx)' }}
+                placeholder="Engineering" value={form.department}
+                onChange={e => setForm({ ...form, department: e.target.value })} />
+            </div>
+            <div>
+              <label style={{ ...fld.smallLabel, color:'var(--tx2)' }}>Seniority Level</label>
+              <select style={{ ...fld.smallInput, background:'var(--pan)', border:'1px solid var(--ln)', color:'var(--tx)' }}
+                value={form.seniority} onChange={e => setForm({ ...form, seniority: e.target.value })}>
+                {['junior','mid','senior','lead','manager','director'].map(s => (
+                  <option key={s} value={s}>{s.charAt(0).toUpperCase()+s.slice(1)}</option>
+                ))}
+              </select>
+            </div>
+            <div>
+              <label style={{ ...fld.smallLabel, color:'var(--tx2)' }}>Max Interviews / Week</label>
+              <input style={{ ...fld.smallInput, background:'var(--pan)', border:`1px solid ${formErrors.max_per_week?'#e0758a':'var(--ln)'}`, color:'var(--tx)' }}
+                type="number" min="1" max="10" value={form.max_per_week}
+                onChange={e => { setForm({ ...form, max_per_week: e.target.value });
+                  if (formErrors.max_per_week) setFormErrors({ ...formErrors, max_per_week:null }); }} />
+              {formErrors.max_per_week && <div style={fld.errorText}>⚠️ {formErrors.max_per_week}</div>}
+            </div>
+            <div style={{ gridColumn:'1/-1' }}>
+              <label style={{ ...fld.smallLabel, color:'var(--tx2)' }}>Skills (comma-separated) *</label>
+              <input style={{ ...fld.smallInput, background:'var(--pan)', border:`1px solid ${formErrors.skills?'#e0758a':'var(--ln)'}`, color:'var(--tx)' }}
+                placeholder="Python, Azure ML, System Design, FastAPI" value={form.skills}
+                onChange={e => { setForm({ ...form, skills: e.target.value });
+                  if (formErrors.skills) setFormErrors({ ...formErrors, skills:null }); }} />
+              {formErrors.skills && <div style={fld.errorText}>⚠️ {formErrors.skills}</div>}
+            </div>
+            {hrUsers.length > 0 && (
+              <div style={{ gridColumn:'1/-1' }}>
+                <label style={{ ...fld.smallLabel, color:'var(--tx2)' }}>Adding As HR</label>
+                <select style={{ ...fld.smallInput, background:'var(--pan)', border:'1px solid var(--ln)', color:'var(--tx)' }}
+                  value={form.hr_id} onChange={e => setForm({ ...form, hr_id: e.target.value })}>
+                  {hrUsers.map(hr => <option key={hr.id} value={hr.id}>{hr.name} ({hr.email})</option>)}
+                </select>
+              </div>
+            )}
+          </div>
+          {Object.keys(formErrors).filter(k => formErrors[k]).length > 0 && (
+            <div style={{ background:'rgba(224,117,138,.1)', border:'1px solid rgba(224,117,138,.3)',
+              borderRadius:10, padding:12, marginTop:16 }}>
+              <div style={{ fontSize:13, fontWeight:600, color:'var(--rs)', marginBottom:6 }}>
+                Please fix the following errors:
+              </div>
+              {Object.entries(formErrors).filter(([,v]) => v).map(([k,v]) => (
+                <div key={k} style={{ fontSize:12, color:'var(--rs)', marginBottom:2 }}>• {v}</div>
+              ))}
+            </div>
+          )}
+          <div style={{ display:'flex', gap:10, marginTop:16 }}>
+            <button onClick={handleAdd} disabled={loading}
+              style={{ flex:1, padding:10, background:'linear-gradient(135deg,var(--jd),#3f6fd1)',
+                color:'#fff', border:'none', borderRadius:10, cursor:'pointer', fontWeight:700 }}>
+              {loading ? '⏳ Sending…' : '📧 Send Invitation'}
+            </button>
+            <button onClick={() => { setShowAdd(false); setFormErrors({}); }}
+              style={{ padding:'10px 20px', background:'var(--pan)', color:'var(--tx2)',
+                border:'1px solid var(--ln)', borderRadius:10, cursor:'pointer', fontWeight:600 }}>
+              Cancel
+            </button>
+          </div>
+        </div>
+      )}
+
+      {interviewers.length === 0 ? (
+        <div style={{ textAlign:'center', padding:'60px 20px', color:'var(--tx3)' }}>
+          <div style={{ fontSize:48, marginBottom:16 }}>👥</div>
+          <p style={{ fontSize:16, fontWeight:600, marginBottom:8, color:'var(--tx2)' }}>No interviewers yet</p>
+          <p style={{ fontSize:14 }}>Add interviewers so AI can automatically assign the right person to each candidate.</p>
+        </div>
+      ) : (
+        <div style={{ display:'grid', gridTemplateColumns:'repeat(auto-fill,minmax(320px,1fr))', gap:16 }}>
+          {interviewers.map(iv => {
+            const s = sc(iv.status);
+            const avail = iv.status==='active' && iv.current_booked < iv.max_per_week;
+            return (
+              <div key={iv.id} style={{ background:'var(--pan2)', border:'1px solid var(--ln)',
+                borderRadius:14, padding:20 }}>
+                <div style={{ display:'flex', justifyContent:'space-between',
+                  alignItems:'flex-start', marginBottom:12 }}>
+                  <div>
+                    <div style={{ fontWeight:700, fontSize:15 }}>{iv.name}</div>
+                    <div style={{ fontSize:12, color:'var(--tx2)', marginTop:2 }}>
+                      {iv.role} · {iv.department}
+                    </div>
+                  </div>
+                  <div style={{ display:'flex', flexDirection:'column', alignItems:'flex-end', gap:4 }}>
+                    <span style={{ background:s.bg, color:s.color, padding:'3px 10px',
+                      borderRadius:100, fontSize:11, fontWeight:700, textTransform:'uppercase' }}>
+                      {iv.status}
+                    </span>
+                    {avail && (
+                      <span style={{ background:'rgba(74,222,128,.15)', color:'#4ade80',
+                        padding:'2px 8px', borderRadius:100, fontSize:10, fontWeight:600 }}>
+                        Available
+                      </span>
+                    )}
+                  </div>
+                </div>
+                <div style={{ display:'flex', flexWrap:'wrap', gap:4, marginBottom:12 }}>
+                  {(iv.expertise_skills||[]).map(sk => (
+                    <span key={sk} style={{ background:'var(--jdim)', color:'var(--jd)',
+                      padding:'2px 8px', borderRadius:100, fontSize:11 }}>{sk}</span>
+                  ))}
+                </div>
+                <div style={{ display:'grid', gridTemplateColumns:'repeat(3,1fr)', gap:8, marginBottom:12 }}>
+                  {[
+                    { l:'Done',     v: iv.total_done||0 },
+                    { l:'Booked',   v: `${iv.current_booked||0}/${iv.max_per_week||3}` },
+                    { l:'Response', v: `${iv.response_rate||100}%` },
+                  ].map(st => (
+                    <div key={st.l} style={{ background:'var(--pan)', borderRadius:8,
+                      padding:8, textAlign:'center' }}>
+                      <div style={{ fontFamily:'JetBrains Mono', fontSize:16,
+                        fontWeight:700, marginBottom:2 }}>{st.v}</div>
+                      <div style={{ fontSize:10, color:'var(--tx3)' }}>{st.l}</div>
+                    </div>
+                  ))}
+                </div>
+                <div style={{ fontSize:12, color:'var(--tx2)' }}>
+                  Level: <strong style={{ color:'var(--tx)' }}>{iv.seniority}</strong> · {iv.timezone||'Asia/Kolkata'}
+                </div>
+                {iv.status==='pending' && (
+                  <div style={{ marginTop:10, fontSize:12, color:'var(--am)',
+                    background:'rgba(216,184,120,.1)', padding:'6px 10px', borderRadius:8 }}>
+                    ⏳ Invitation sent — waiting for acceptance
+                  </div>
+                )}
+              </div>
+            );
+          })}
+        </div>
+      )}
+
+      {assignments.length > 0 && (
+        <div style={{ marginTop:32 }}>
+          <h3 style={{ color:'var(--tx)', marginBottom:16, fontFamily:'Bricolage Grotesque' }}>
+            Recent Assignments
+          </h3>
+          {assignments.slice(0,5).map(a => (
+            <div key={a.id} style={{ background:'var(--pan2)', border:'1px solid var(--ln)',
+              borderRadius:12, padding:16, marginBottom:10 }}>
+              <div style={{ display:'flex', justifyContent:'space-between',
+                alignItems:'center', marginBottom:8 }}>
+                <div style={{ fontWeight:600, fontSize:13 }}>
+                  Candidate: {a.candidate_id?.slice(0,8)}...
+                </div>
+                <span style={{ fontSize:11, fontWeight:700, padding:'2px 8px', borderRadius:100,
+                  background: a.status==='accepted' ? 'rgba(74,222,128,.15)'
+                    : a.status==='hr_action_required' ? 'rgba(224,117,138,.15)' : 'var(--pan)',
+                  color: a.status==='accepted' ? '#4ade80'
+                    : a.status==='hr_action_required' ? 'var(--rs)' : 'var(--tx2)' }}>
+                  {a.status?.replace(/_/g,' ').toUpperCase()}
+                </span>
+              </div>
+              <div style={{ fontSize:12, color:'var(--tx2)' }}>
+                Level: {a.escalation_level||0} · Type: {a.interview_type} · {a.created_at?.slice(0,10)}
+              </div>
+              {(a.timeline||[]).slice(-2).map((t,i) => (
+                <div key={i} style={{ fontSize:11, color:'var(--tx3)', marginTop:4 }}>
+                  {t.time?.slice(11,16)} — {t.event}: {t.detail}
+                </div>
+              ))}
+            </div>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
+/* ════════════════════════════════════════════════════════════════════
+   AGENT FEED VIEW
+════════════════════════════════════════════════════════════════════ */
+function TalentPoolView({ candidates }) {
+  const pool = candidates.filter(c => c.status==='rejected' && (c.resume_score||0) >= 60);
+  return (
+    <div>
+      <div className="hs-rise" style={{ marginBottom:26 }}>
+        <h1 style={{ fontFamily:'Bricolage Grotesque', fontWeight:800, fontSize:34,
+          letterSpacing:'-0.03em' }}>Talent Reserve</h1>
+        <p style={{ color:'var(--tx2)', fontSize:14, marginTop:8 }}>
+          Strong candidates not selected this time — notified when a matching role opens.
+        </p>
+      </div>
+      {pool.length === 0 ? (
+        <div style={{ textAlign:'center', padding:'60px 20px', color:'var(--tx3)' }}>
+          <div style={{ fontSize:48, marginBottom:12 }}>◍</div>
+          <p>No candidates in reserve yet</p>
+        </div>
+      ) : pool.map((c, i) => (
+        <div key={c.id} className={`hs-rise hs-d${(i%5)+1}`}
+          style={{ background:'linear-gradient(160deg,var(--pan),var(--ob2))',
+            border:'1px solid var(--ln)', borderRadius:14, padding:16, marginBottom:12,
+            display:'flex', justifyContent:'space-between', alignItems:'center' }}>
+          <div>
+            <div style={{ fontWeight:700 }}>{c.name}</div>
+            <div style={{ fontSize:13, color:'var(--tx2)', marginBottom:8 }}>{c.applied_role}</div>
+            <div style={{ display:'flex', flexWrap:'wrap', gap:4 }}>
+              {(c.skills||[]).map(sk => (
+                <span key={sk} style={{ background:'var(--jdim)', color:'var(--jd)',
+                  padding:'2px 8px', borderRadius:100, fontSize:11 }}>{sk}</span>
+              ))}
+            </div>
+          </div>
+          <div style={{ textAlign:'center', flexShrink:0, marginLeft:16 }}>
+            <div style={{ fontFamily:'JetBrains Mono', fontSize:24, fontWeight:700,
+              color:'var(--jd)' }}>{c.resume_score}/100</div>
+            <div style={{ fontSize:11, color:'var(--tx3)' }}>Score</div>
+          </div>
+        </div>
+      ))}
+    </div>
+  );
+}
+
+/* ════════════════════════════════════════════════════════════════════
+   COST & INSIGHTS VIEW
+════════════════════════════════════════════════════════════════════ */
+export default function App() {
+  const [view, setView]     = useState('requisitions');
+  const [pipelineJobFilter, setPipelineJobFilter] = useState(null);
+  const [jobs, setJobs]     = useState([]);
+  const [candidates, setCandidates] = useState([]);
+  const [cLoading, setCLoading]     = useState(true);
+  const [selected, setSelected]     = useState(null);
+  const [approvalForm, setApprovalForm] = useState({
+    tech_score:'', culture_score:'', notes:'', salary:'', round:'technical',
+  });
+
+  /* inject design system CSS */
+  useEffect(() => {
+    const el = document.createElement('style');
+    el.id = 'hs-design-system';
+    el.textContent = DESIGN_CSS;
+    document.head.prepend(el);
+    return () => el.remove();
+  }, []);
+
+  const hasLoadedOnce = useRef(false);
+
+  const loadData = useCallback(() => {
+    axios.get(`${API_URL}/api/jobs`).then(r => setJobs(Array.isArray(r.data) ? r.data : [])).catch(() => {});
+    if (!hasLoadedOnce.current) setCLoading(true);
+    axios.get(`${API_URL}/api/candidates`)
+      .then(r => { setCandidates(r.data || []); setCLoading(false); hasLoadedOnce.current = true; })
+      .catch(() => { setCandidates([]); setCLoading(false); hasLoadedOnce.current = true; });
+  }, []);
+
+  useEffect(() => {
+    loadData();
+    const t = setInterval(loadData, 10_000);
+    return () => clearInterval(t);
+  }, [loadData]);
+
+  const handleApprove = async (candidateId, decision) => {
+    try {
+      await axios.post(`${API_URL}/api/human-gate`, {
+        candidate_id: candidateId, decision,
+        tech_score:    parseFloat(approvalForm.tech_score)||8,
+        culture_score: parseFloat(approvalForm.culture_score)||7,
+        notes:         approvalForm.notes,
+        agreed_salary: approvalForm.salary,
+        round:         approvalForm.round,
+      });
+    } catch {}
+    setCandidates(prev => prev.map(c =>
+      c.id === candidateId
+        ? { ...c, status: decision==='APPROVE' ? 'hired' : 'rejected' }
+        : c
+    ));
+    setSelected(null);
+  };
+
+  const NAV = [
+    { key:'requisitions', ico:'◫', label:'Requisitions',   badge: jobs.filter(isActive).length, section:'Operations' },
+    { key:'pipeline',     ico:'⊞', label:'Talent Pipeline', badge: candidates.filter(c => !['hired','rejected'].includes(c.status)).length },
+    { key:'panel',        ico:'◎', label:'Interview Panel' },
+    { key:'live',         ico:'⚡', label:'Live Operations', section:'Intelligence' },
+    { key:'reserve',      ico:'◍', label:'Talent Reserve',  badge: candidates.filter(c => c.status==='rejected' && (c.resume_score||0)>=60).length },
+    { key:'costs',        ico:'◉', label:'Cost & Insights' },
+  ];
+
+  return (
+    <div className="hs-root" style={{
+      position:'relative', zIndex:1,
+      display:'grid', gridTemplateColumns:'248px 1fr', height:'100vh',
+    }}>
+      {/* ── Sidebar ── */}
+      <aside style={{
+        background:'linear-gradient(180deg,var(--ob2),var(--ob))',
+        borderRight:'1px solid var(--ln)',
+        display:'flex', flexDirection:'column', padding:'22px 16px',
+      }}>
+        {/* brand */}
+        <div style={{ display:'flex', alignItems:'center', gap:11, padding:'6px 8px 26px' }}>
+          <div style={{ width:38, height:38, borderRadius:11, flexShrink:0,
+            background:'linear-gradient(135deg,var(--jd),var(--cy))',
+            display:'grid', placeItems:'center', fontSize:20, color:'#fff',
+            boxShadow:'0 6px 20px -4px rgba(91,141,239,.5)' }}>◈</div>
+          <div>
+            <div style={{ fontFamily:'Bricolage Grotesque', fontWeight:800,
+              fontSize:18, letterSpacing:'-0.02em' }}>HR Swarm</div>
+            <div style={{ fontSize:10, color:'var(--tx3)', letterSpacing:'0.18em',
+              textTransform:'uppercase', fontFamily:'JetBrains Mono' }}>Mission Control</div>
+          </div>
+        </div>
+
+        {/* nav */}
+        {NAV.map(item => (
+          <React.Fragment key={item.key}>
+            {item.section && (
+              <div style={{ fontSize:10, color:'var(--tx3)', letterSpacing:'0.16em',
+                textTransform:'uppercase', fontFamily:'JetBrains Mono',
+                padding:'14px 10px 8px' }}>{item.section}</div>
+            )}
+            <div className={`hs-nav${view===item.key?' on':''}`}
+              onClick={() => setView(item.key)}>
+              <span style={{ width:18, textAlign:'center', fontSize:15, opacity:.9 }}>
+                {item.ico}
+              </span>
+              {item.label}
+              {item.badge != null && (
+                <span style={{ marginLeft:'auto', fontFamily:'JetBrains Mono', fontSize:11,
+                  background: view===item.key ? 'var(--jdim)' : 'var(--pan2)',
+                  color:      view===item.key ? 'var(--jd)'   : 'var(--tx2)',
+                  padding:'2px 7px', borderRadius:6 }}>
+                  {item.badge}
+                </span>
+              )}
+            </div>
+          </React.Fragment>
+        ))}
+
+        {/* foot */}
+        <div style={{ marginTop:'auto', padding:'14px 12px',
+          borderTop:'1px solid var(--ln)', display:'flex', alignItems:'center', gap:11 }}>
+          <div style={{ width:34, height:34, borderRadius:'50%', flexShrink:0,
+            background:'linear-gradient(135deg,var(--vi),var(--cy))',
+            display:'grid', placeItems:'center', fontWeight:700, fontSize:13 }}>JJ</div>
+          <div>
+            <div style={{ fontSize:13, fontWeight:500 }}>Jefri Jebason</div>
+            <div style={{ fontSize:11, color:'var(--tx3)' }}>Talent Lead</div>
+          </div>
+        </div>
+      </aside>
+
+      {/* ── Main ── */}
+      <main style={{ display:'flex', flexDirection:'column', overflow:'hidden' }}>
+        {/* topbar */}
+        <div style={{ height:68, borderBottom:'1px solid var(--ln)',
+          display:'flex', alignItems:'center', padding:'0 28px', gap:20,
+          background:'rgba(7,10,15,.6)', backdropFilter:'blur(12px)', flexShrink:0 }}>
+          <div style={{ flex:1, maxWidth:420, display:'flex', alignItems:'center', gap:10,
+            background:'var(--pan)', border:'1px solid var(--ln)',
+            borderRadius:11, padding:'10px 14px' }}>
+            <span style={{ color:'var(--tx3)', fontSize:16 }}>⌕</span>
+            <input style={{ background:'none', border:'none', outline:'none',
+              color:'var(--tx)', fontFamily:'Sora', fontSize:13, width:'100%' }}
+              placeholder="Search requisitions, candidates, interviewers…" />
+          </div>
+          <div style={{ marginLeft:'auto', display:'flex', alignItems:'center', gap:14 }}>
+            <div style={{ display:'flex', alignItems:'center', gap:8, fontSize:12,
+              color:'var(--tx2)', fontFamily:'JetBrains Mono',
+              background:'var(--pan)', border:'1px solid var(--ln)',
+              padding:'8px 13px', borderRadius:9 }}>
+              <div className="hs-dot" /> 6 agents live
+            </div>
+            <div className="hs-ico">◐</div>
+            <div className="hs-ico">⊹</div>
+          </div>
+        </div>
+
+        {/* content */}
+        <div className="hs-scr" style={{ flex:1, overflowY:'auto', padding:'30px 32px 60px' }}>
+          {view === 'requisitions' && (
+            <RequisitionsView jobs={jobs} candidates={candidates} onRefresh={loadData}
+              onNavigatePipeline={(jobId) => { setPipelineJobFilter(jobId || null); setView('pipeline'); }} />
+          )}
+          {view === 'pipeline' && (
+            <PipelineView candidates={candidates} loading={cLoading} onRefresh={loadData}
+              jobs={jobs} initialJobFilter={pipelineJobFilter}
+              onJobFilterChange={setPipelineJobFilter} />
+          )}
+          {view === 'panel'   && <InterviewerPoolView />}
+          {view === 'live'    && <AgentFeedView />}
+          {view === 'reserve' && <TalentPoolView candidates={candidates} />}
+          {view === 'costs'   && <AnalyticsView candidates={candidates} jobs={jobs} />}
+        </div>
+      </main>
+    </div>
+  );
 }

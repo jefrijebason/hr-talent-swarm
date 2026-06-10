@@ -26,25 +26,40 @@ export default function BrowsePage({ onSelectJob }) {
     return () => window.removeEventListener('resize', onResize);
   }, []);
 
-  useEffect(() => {
-    setIsLoading(true);
+useEffect(() => {
+  let isFirst = true;
+
+  const loadJobs = () => {
+    const wasFirst = isFirst; // capture current state for this call
+    if (wasFirst) setIsLoading(true);
+
     axios.get(`${API_URL}/api/jobs`)
       .then(r => {
         const activeJobs = (r.data || []).filter(j => j.status !== 'closed');
-        if (activeJobs.length > 0) {
-          setJobs(activeJobs);
-          setSelected(activeJobs[0]);
+        setJobs(activeJobs);
+        if (wasFirst) {
+          setSelected(activeJobs[0] || null);
         } else {
-          setJobs([]);
-          setSelected(null);
+          setSelected(prev =>
+            activeJobs.find(j => j.id === prev?.id) || prev
+          );
         }
       })
       .catch(() => {
-        setJobs([]);
-        setSelected(null);
+        if (wasFirst) { setJobs([]); setSelected(null); }
       })
-      .finally(() => setIsLoading(false));
-  }, []);
+      .finally(() => {
+        if (wasFirst) {
+          setIsLoading(false);
+          isFirst = false; // only flip AFTER loading state cleared
+        }
+      });
+  };
+
+  loadJobs();
+  const t = setInterval(loadJobs, 10000);
+  return () => clearInterval(t);
+}, []);
 
   const filtered = jobs.filter(j => {
     const matchSearch = !search ||
@@ -79,15 +94,32 @@ export default function BrowsePage({ onSelectJob }) {
     );
   }
 
-  if (jobs.length === 0) {
+ if (jobs.length === 0) {
     return (
-      <div style={{ maxWidth: '1200px', margin: '0 auto', padding: '60px 24px 80px', textAlign: 'center' }}>
-        <h2 style={{ ...fonts.h1, color: theme.textPrimary, marginBottom: '12px' }}>No roles available</h2>
-        <p style={{ ...fonts.body, color: theme.textSecondary, marginBottom: '28px' }}>Check back soon or contact HR for updates.</p>
-        <AuroraButton onClick={() => window.location.reload()}>Refresh</AuroraButton>
+      <div style={{ maxWidth: '600px', margin: '0 auto', padding: '80px 24px 100px', textAlign: 'center' }}>
+        <motion.div
+          initial={{ scale: 0.9, opacity: 0 }}
+          animate={{ scale: 1, opacity: 1 }}
+          transition={{ duration: 0.5 }}>
+          <div style={{ fontSize: '64px', marginBottom: '20px', opacity: 0.85 }}>🌱</div>
+          <h2 style={{ ...fonts.h1, color: theme.textPrimary, marginBottom: '14px' }}>
+            <GradientText>New opportunities coming soon</GradientText>
+          </h2>
+          <p style={{ ...fonts.body, color: theme.textSecondary,
+            marginBottom: '8px', lineHeight: 1.7, maxWidth: '440px', margin: '0 auto 8px' }}>
+            We're not actively hiring for any roles at this moment, but we're always
+            growing and adding new positions.
+          </p>
+          <p style={{ ...fonts.body, color: theme.textSecondary,
+            lineHeight: 1.7, maxWidth: '440px', margin: '0 auto' }}>
+            This page refreshes automatically — check back soon, and you'll see new
+            roles the instant they go live.
+          </p>
+        </motion.div>
       </div>
     );
   }
+ 
 
   return (
     <div style={{ maxWidth: '1200px', margin: '0 auto', padding: '40px 24px 80px' }}>

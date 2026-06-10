@@ -1,12 +1,19 @@
 from fastapi import FastAPI, File, UploadFile, Form, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from datetime import datetime
+from datetime import datetime, timedelta
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 from typing import Optional
+import threading
 import uvicorn
 import uuid
 import io
+
+from contextlib import asynccontextmanager
+from fastapi import FastAPI, HTTPException, Request, Body
+from fastapi.responses import HTMLResponse
+from fastapi import FastAPI, HTTPException, Body, Form
+from pydantic import BaseModel
 
 from shared.cosmos_client import (
     save_candidate, get_candidate,
@@ -32,10 +39,52 @@ from agents.interviewer.anti_malpractice import (
 )
 from shared.config import config
 
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    print("[STARTUP] Checking for stuck candidates...")
+    try:
+        candidates = get_all_candidates()
+        stuck = [c for c in candidates
+                 if c.get("status") == "applied"]
+        if stuck:
+            print(f"[STARTUP] Found {len(stuck)} stuck — will retry")
+            for c in stuck:
+                update_candidate(c["id"], {"status": "needs_requeue"})
+        else:
+            print("[STARTUP] No stuck candidates found")
+    except Exception as e:
+        print(f"[STARTUP] Recovery error: {e}")
+
+    # ── Schedule daily digest at 8 AM ───────────────────────────
+    import threading, time
+
+    def schedule_digest():
+        while True:
+            now = datetime.utcnow()
+            next_run = now.replace(hour=2, minute=30,
+                                   second=0, microsecond=0)
+            if now >= next_run:
+                next_run += timedelta(days=1)
+            wait_seconds = (next_run - now).total_seconds()
+            print(f"[DIGEST] Next digest in {wait_seconds/3600:.1f} hours")
+            time.sleep(wait_seconds)
+            try:
+                from shared.daily_digest import send_daily_digest
+                send_daily_digest()
+            except Exception as e:
+                print(f"[DIGEST] Scheduled run error: {e}")
+
+    digest_thread = threading.Thread(target=schedule_digest, daemon=True)
+    digest_thread.start()
+    print("[STARTUP] Daily digest scheduler started (8 AM IST)")
+
+    yield
+    
 app = FastAPI(
     title="HR Talent Intelligence Swarm API",
     description="Backend API for HR Swarm platform",
-    version="1.0.0"
+    version="1.0.0",
+    lifespan=lifespan
 )
 
 # ── CORS — Allow React apps to call this API ────────────────────
@@ -482,6 +531,7 @@ class JobPostRequest(BaseModel):
     salary_max:       str = ""
     location:         str = "Bangalore"
     human_rounds:     list = []
+    status: str = "active"
 
 @app.post("/api/jobs")
 async def post_job(request: JobPostRequest):
@@ -520,7 +570,7 @@ async def post_job(request: JobPostRequest):
             "salary_max":             request.salary_max,
             "location":               request.location,
             "human_rounds":           human_rounds,
-            "status":                 "active",
+            "status":                 request.status,
             "role_category":          intel.get("role_category"),
             "seniority_level":        intel.get("seniority_level"),
             "tech_stack":             intel.get("tech_stack", []),
@@ -545,14 +595,13 @@ async def post_job(request: JobPostRequest):
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/api/jobs")
-def get_jobs():
-    """Get all active jobs."""
+def get_jobs(include_closed: bool = False):
     try:
-        from shared.cosmos_client import get_active_jobs
-        return get_active_jobs()
+        from shared.cosmos_client import get_active_jobs, get_all_jobs
+        return get_all_jobs() if include_closed else get_active_jobs()
     except Exception as e:
         return []
-
+    
 @app.get("/api/jobs/{job_id}")
 def get_job(job_id: str):
     """Get single job details."""
@@ -564,7 +613,19 @@ def get_job(job_id: str):
         return job
     except Exception as e:
         raise HTTPException(status_code=404, detail="Job not found")
-
+@app.patch("/api/jobs/{job_id}")
+def update_job_status(job_id: str, request: dict = Body(...)):
+    """Close or reopen a job."""
+    try:
+        from shared.cosmos_client import update_job_status
+        new_status = request.get("status", "closed")
+        result = update_job_status(job_id, new_status)
+        if not result:
+            raise HTTPException(status_code=404, detail="Job not found")
+        return {"success": True, "job_id": job_id, "status": new_status}
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    
 @app.post("/api/apply-for-job")
 async def apply_for_job(
     name:         str        = Form(...),
@@ -725,28 +786,497 @@ def decline_interviewer(token: str):
         update_interviewer(iv["id"], {"status": "inactive"})
     return {"message": "Thank you for letting us know."}
 
-# ── Assignment API ───────────────────────────────────────────────
-@app.get("/api/assignments/{assignment_id}/accept")
-def accept_assignment(assignment_id: str):
-    """Interviewer accepts interview request."""
-    from agents.interviewer_pool.escalation import handle_acceptance
-    try:
-        handle_acceptance(assignment_id)
-        return {"message": "Interview accepted! The candidate will be notified."}
-    except Exception as e:
-        return {"message": "Accepted. Please check your email for meeting details."}
+# ════════════════════════════════════════════════════════════════════════
+# PASTE THIS WHOLE BLOCK INTO YOUR main.py
+# ════════════════════════════════════════════════════════════════════════
+#
+# This adds:
+#   1. HTMLResponse for /api/assignments/{id}/accept and /decline
+#      (replaces the JSON-only pages your interviewers see now)
+#   2. GET /api/assignments/{id}/schedule  — scheduling form HTML page
+#   3. POST /api/assignments/{id}/schedule — saves chosen time, mails candidate
+#   4. POST /api/talent-reserve/email      — sends invite/offer/note to reserve
+#   5. POST /api/talent-reserve/fast-track — moves candidate to a new job pipeline
+#
+# REQUIRED IMPORTS at the top of main.py — add any that are missing:
+#
+#   from fastapi import FastAPI, HTTPException, Body
+#   from fastapi.responses import HTMLResponse, RedirectResponse
+#   from pydantic import BaseModel
+#   from datetime import datetime, timedelta
+#
+# ════════════════════════════════════════════════════════════════════════
 
-@app.get("/api/assignments/{assignment_id}/decline")
-def decline_assignment(assignment_id: str):
-    """Interviewer declines interview request."""
-    from agents.interviewer_pool.escalation import check_and_escalate
-    from shared.cosmos_client import update_assignment
-    update_assignment(assignment_id, {
-        "status": "declined",
-        "response_deadline": datetime.utcnow().isoformat()
-    })
-    check_and_escalate(assignment_id)
-    return {"message": "Understood. The request has been reassigned."}
+
+# ── 1. STYLED HTML PAGE TEMPLATE ────────────────────────────────────────
+def _response_page(title: str, icon: str, color: str, headline: str,
+                    body_html: str, cta_html: str = "") -> str:
+    """Single source of truth for the dark Mission Control response pages."""
+    return f"""<!DOCTYPE html>
+<html lang="en"><head>
+<meta charset="UTF-8"><title>{title}</title>
+<meta name="viewport" content="width=device-width,initial-scale=1.0">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Bricolage+Grotesque:wght@600;800&family=Sora:wght@400;500;600&family=JetBrains+Mono:wght@500&display=swap" rel="stylesheet">
+<style>
+  *{{margin:0;padding:0;box-sizing:border-box}}
+  body{{font-family:'Sora',sans-serif;background:#080b12;color:#eaeef6;
+    min-height:100vh;display:grid;place-items:center;padding:24px;
+    -webkit-font-smoothing:antialiased;overflow-x:hidden}}
+  body::before{{content:'';position:fixed;inset:0;z-index:0;pointer-events:none;
+    background:radial-gradient(800px 500px at 12% 8%,rgba(91,141,239,.10),transparent 60%),
+      radial-gradient(700px 600px at 92% 90%,rgba(109,180,240,.06),transparent 55%)}}
+  .card{{position:relative;z-index:1;max-width:520px;width:100%;
+    background:linear-gradient(160deg,#111726,#0d121d);
+    border:1px solid rgba(255,255,255,.08);border-radius:22px;
+    padding:48px 44px;text-align:center;
+    box-shadow:0 30px 80px -20px rgba(0,0,0,.6);
+    animation:rise .6s cubic-bezier(.2,.8,.2,1) both}}
+  @keyframes rise{{from{{opacity:0;transform:translateY(20px)}}to{{opacity:1;transform:translateY(0)}}}}
+  .icon{{width:80px;height:80px;border-radius:50%;
+    background:{color}22;display:grid;place-items:center;
+    font-size:38px;margin:0 auto 22px;border:2px solid {color}40}}
+  h1{{font-family:'Bricolage Grotesque',sans-serif;font-weight:800;
+    font-size:28px;letterSpacing:-0.02em;margin-bottom:10px}}
+  .accent{{color:{color}}}
+  p{{color:#92a0ba;font-size:15px;line-height:1.65;margin-bottom:22px}}
+  strong{{color:#eaeef6}}
+  .cta{{margin-top:28px}}
+  .btn{{display:inline-block;padding:14px 32px;border-radius:12px;
+    background:linear-gradient(135deg,{color},#3f6fd1);color:#fff;
+    text-decoration:none;font-weight:700;font-size:15px;
+    box-shadow:0 8px 28px -8px {color}99;transition:.2s;border:none;cursor:pointer}}
+  .btn:hover{{transform:translateY(-2px);box-shadow:0 14px 36px -8px {color}cc}}
+  .btn-ghost{{background:#172033;border:1px solid rgba(255,255,255,.11);
+    color:#92a0ba;margin-left:10px}}
+  .meta{{margin-top:24px;padding-top:20px;border-top:1px solid rgba(255,255,255,.06);
+    font-family:'JetBrains Mono',monospace;font-size:11px;color:#5a667e;
+    letter-spacing:0.05em}}
+</style></head>
+<body>
+  <div class="card">
+    <div class="icon">{icon}</div>
+    <h1>{headline}</h1>
+    {body_html}
+    <div class="cta">{cta_html}</div>
+    <div class="meta">HR SWARM · Mission Control</div>
+  </div>
+</body></html>"""
+
+
+# ── 2. REPLACE YOUR EXISTING /accept ENDPOINT WITH THIS ──────────────────
+# (find your current `@app.get("/api/assignments/{aid}/accept")` and replace it)
+
+@app.get("/api/assignments/{aid}/accept", response_class=HTMLResponse)
+def accept_assignment_html(aid: str):
+    """Interviewer accepted — show success and redirect to scheduling page."""
+    try:
+        from shared.cosmos_client import get_assignment, update_assignment
+        a = get_assignment(aid)
+        if not a:
+            return HTMLResponse(_response_page(
+                "Not Found", "✕", "#e0758a",
+                "Assignment not found",
+                "<p>This invitation link is no longer valid or has expired.</p>"
+            ), status_code=404)
+
+        if a.get("status") != "accepted":
+            update_assignment(aid, {"status": "accepted",
+                                     "accepted_at": datetime.utcnow().isoformat()})
+
+        return HTMLResponse(_response_page(
+            "Interview Accepted",
+            "✓",
+            "#5b8def",
+            "Thank you for accepting!",
+            f"""<p>Great — you've accepted the interview for
+                <strong>{a.get('candidate_name','the candidate')}</strong>
+                ({a.get('role_name','this role')}).</p>
+                <p>The next step is to <strong>pick a date and time</strong> that works for you.
+                We'll send the calendar invite to the candidate.</p>""",
+            f"""<a class="btn" href="/api/assignments/{aid}/schedule">📅 Pick Date & Time →</a>"""
+        ))
+    except Exception as e:
+        return HTMLResponse(_response_page(
+            "Error", "✕", "#e0758a", "Something went wrong",
+            f"<p>{str(e)}</p>"
+        ), status_code=500)
+
+
+# ── 3. REPLACE YOUR EXISTING /decline ENDPOINT WITH THIS ─────────────────
+@app.get("/api/assignments/{aid}/decline", response_class=HTMLResponse)
+def decline_assignment_html(aid: str):
+    """Interviewer declined — show confirmation and trigger re-routing."""
+    try:
+        from shared.cosmos_client import get_assignment, update_assignment
+        a = get_assignment(aid)
+        if not a:
+            return HTMLResponse(_response_page(
+                "Not Found", "✕", "#e0758a",
+                "Assignment not found",
+                "<p>This invitation link is no longer valid or has expired.</p>"
+            ), status_code=404)
+
+        update_assignment(aid, {"status": "declined",
+                                 "declined_at": datetime.utcnow().isoformat()})
+
+        # Trigger backup interviewer re-routing using existing escalation logic
+        try:
+            from agents.interviewer_pool.escalation import _escalate_to_backup1
+            _escalate_to_backup1(aid, a)
+            print(f"[DECLINE] Re-routed assignment {aid} to backup interviewer")
+        except Exception as reroute_err:
+            print(f"[DECLINE] Re-route error: {reroute_err}")
+
+        return HTMLResponse(_response_page(
+            "Interview Declined",
+            "↻",
+            "#d8b878",
+            "No problem — thanks for letting us know",
+            f"""<p>We've recorded that you can't take the
+                <strong>{a.get('role_name','this')}</strong> interview at this time.</p>
+                <p>The candidate will be reassigned to a backup interviewer automatically.
+                No further action needed from you.</p>"""
+        ))
+    except Exception as e:
+        return HTMLResponse(_response_page(
+            "Error", "✕", "#e0758a", "Something went wrong",
+            f"<p>{str(e)}</p>"
+        ), status_code=500)
+
+
+# ── 4. SCHEDULING PAGE — GET (form) ──────────────────────────────────────
+@app.get("/api/assignments/{aid}/schedule", response_class=HTMLResponse)
+def schedule_form(aid: str):
+    """Interviewer picks date/time within deadline."""
+    try:
+        from shared.cosmos_client import get_assignment
+        a = get_assignment(aid)
+        if not a:
+            return HTMLResponse(_response_page(
+                "Not Found", "✕", "#e0758a", "Assignment not found",
+                "<p>This link is no longer valid.</p>"
+            ), status_code=404)
+
+        # Default deadline: 7 days from now if not set
+        deadline = a.get("deadline") or (datetime.utcnow() + timedelta(days=7)).isoformat()
+        # Format for datetime-local input (today at 10:00 default)
+        default_dt = (datetime.utcnow() + timedelta(days=2)).replace(
+            hour=10, minute=0, second=0, microsecond=0
+        ).strftime("%Y-%m-%dT%H:%M")
+        max_dt = datetime.fromisoformat(deadline.replace("Z","")).strftime("%Y-%m-%dT%H:%M") \
+                 if isinstance(deadline, str) else default_dt
+
+        candidate_name = a.get("candidate_name", "the candidate")
+        role_name      = a.get("role_name", "this role")
+
+        body_html = f"""
+            <p>Pick a date and time that works for you. The candidate will be notified
+            immediately and receive the Teams meeting link.</p>
+            <form method="post" action="/api/assignments/{aid}/schedule"
+              style="margin-top:24px;text-align:left">
+              <div style="background:#172033;border:1px solid rgba(255,255,255,.08);
+                border-radius:14px;padding:18px 20px;margin-bottom:18px;
+                font-size:13px;color:#92a0ba">
+                <div style="display:flex;justify-content:space-between;
+                  padding:6px 0;border-bottom:1px solid rgba(255,255,255,.06)">
+                  <span>Candidate</span>
+                  <strong style="color:#eaeef6">{candidate_name}</strong>
+                </div>
+                <div style="display:flex;justify-content:space-between;padding:6px 0">
+                  <span>Role</span>
+                  <strong style="color:#eaeef6">{role_name}</strong>
+                </div>
+              </div>
+              <div style="margin-bottom:18px">
+                <label style="display:block;font-size:11px;color:#5a667e;
+                  font-family:'JetBrains Mono';margin-bottom:8px;
+                  text-transform:uppercase;letter-spacing:0.08em">
+                  Interview Date &amp; Time
+                </label>
+                <input type="datetime-local" name="scheduled_at"
+                  value="{default_dt}" max="{max_dt}" required
+                  style="width:100%;padding:13px 16px;background:#0d121d;
+                  border:1px solid rgba(255,255,255,.11);border-radius:11px;
+                  color:#eaeef6;font-family:'Sora';font-size:14px;outline:none;
+                  color-scheme:dark"/>
+                <div style="font-size:11px;color:#5a667e;margin-top:8px;
+                  font-family:'JetBrains Mono'">
+                  Deadline: {max_dt.replace('T',' ')}
+                </div>
+              </div>
+              <div style="margin-bottom:22px">
+                <label style="display:block;font-size:11px;color:#5a667e;
+                  font-family:'JetBrains Mono';margin-bottom:8px;
+                  text-transform:uppercase;letter-spacing:0.08em">
+                  Note for the candidate (optional)
+                </label>
+                <textarea name="note" rows="3"
+                  placeholder="Looking forward to chatting!"
+                  style="width:100%;padding:12px 14px;background:#0d121d;
+                  border:1px solid rgba(255,255,255,.11);border-radius:11px;
+                  color:#eaeef6;font-family:'Sora';font-size:13px;outline:none;
+                  resize:vertical"></textarea>
+              </div>
+              <button type="submit" class="btn" style="width:100%;display:block">
+                ✓ Confirm &amp; Notify Candidate
+              </button>
+            </form>
+        """
+        return HTMLResponse(_response_page(
+            "Schedule Interview",
+            "📅",
+            "#5b8def",
+            "Schedule the Interview",
+            body_html,
+            ""  # form has its own submit
+        ))
+    except Exception as e:
+        return HTMLResponse(_response_page(
+            "Error", "✕", "#e0758a", "Something went wrong",
+            f"<p>{str(e)}</p>"
+        ), status_code=500)
+
+
+# ── 5. SCHEDULING PAGE — POST (save + notify) ────────────────────────────
+from fastapi import Form
+
+@app.post("/api/assignments/{aid}/schedule", response_class=HTMLResponse)
+def schedule_submit(aid: str,
+                     scheduled_at: str = Form(...),
+                     note: str = Form("")):
+    """Save chosen slot and email candidate."""
+    try:
+        from shared.cosmos_client import get_assignment, update_assignment, get_candidate
+        a = get_assignment(aid)
+        if not a:
+            return HTMLResponse(_response_page(
+                "Not Found", "✕", "#e0758a", "Assignment not found",
+                "<p>This link is no longer valid.</p>"
+            ), status_code=404)
+
+        # Save chosen time
+        update_assignment(aid, {
+            "scheduled_at": scheduled_at,
+            "scheduler_note": note,
+            "status": "scheduled",
+            "scheduled_confirmed_at": datetime.utcnow().isoformat()
+        })
+
+# ── Send candidate email with the chosen time + meeting link ──
+        try:
+            from agents.communicator.agent import send_email
+            from shared.cosmos_client import get_interviewer
+
+            candidate = get_candidate(a["candidate_id"]) if a.get("candidate_id") else None
+            if not candidate or not candidate.get("email"):
+                print(f"[SCHEDULE] No candidate email for assignment {aid}")
+            else:
+                # Resolve interviewer name (handle both pool + custom assignees)
+                iv_id = a.get("assigned_to", "")
+                if iv_id.startswith("custom_"):
+                    iv_name = a.get("custom_assignee_name", "your interviewer")
+                else:
+                    iv = get_interviewer(iv_id) if iv_id else None
+                    iv_name = (iv or {}).get("name", "your interviewer")
+
+                dt_human = datetime.fromisoformat(scheduled_at).strftime(
+                    "%A, %B %d, %Y at %I:%M %p"
+                )
+
+                # Use existing meeting URL if scheduler already created one,
+                # otherwise fall back to a clear "calendar invite to follow" line
+                meeting_url = a.get("meeting_url", "")
+                meeting_section = (
+                    f"""<p><a href="{meeting_url}"
+                       style="display:inline-block;background:#6366f1;color:#fff;
+                       padding:12px 24px;text-decoration:none;border-radius:8px;
+                       font-weight:bold">Join Teams Meeting →</a></p>"""
+                    if meeting_url else
+                    """<p>A Teams calendar invite with the meeting link will arrive shortly.</p>"""
+                )
+
+                note_section = (
+                    f"""<div style="margin-top:18px;padding:14px;background:#f0f9ff;
+                        border-radius:10px;border-left:4px solid #6366f1">
+                        <strong style="color:#1e3a8a">A note from {iv_name}:</strong>
+                        <p style="margin:6px 0 0;color:#1e3a8a">{note}</p>
+                    </div>"""
+                    if note.strip() else ""
+                )
+
+                role = candidate.get("applied_role") or a.get("role_name") or "the role"
+
+                send_email(
+                    to_address=candidate["email"],
+                    subject=f"✅ Interview Confirmed — {role}",
+                    body_html=f"""
+<h2 style="color:#0f172a">Your interview is confirmed!</h2>
+<p>Hi {candidate.get('name','there')},</p>
+<p>Great news — your interview for <strong>{role}</strong> has been scheduled.</p>
+
+<table style="border-collapse:collapse;width:100%;max-width:500px;
+              margin:16px 0;font-size:14px">
+  <tr style="background:#f8fafc">
+    <td style="padding:12px;font-weight:700;width:130px">📅 Date &amp; Time</td>
+    <td style="padding:12px">{dt_human}</td>
+  </tr>
+  <tr>
+    <td style="padding:12px;font-weight:700">👤 Interviewer</td>
+    <td style="padding:12px">{iv_name}</td>
+  </tr>
+  <tr style="background:#f8fafc">
+    <td style="padding:12px;font-weight:700">⏱ Duration</td>
+    <td style="padding:12px">45 minutes</td>
+  </tr>
+  <tr>
+    <td style="padding:12px;font-weight:700">💻 Platform</td>
+    <td style="padding:12px">Microsoft Teams</td>
+  </tr>
+</table>
+
+{meeting_section}
+{note_section}
+
+<h3 style="color:#0f172a;margin-top:24px">How to prepare</h3>
+<ul style="color:#475569;line-height:1.8">
+  <li>Review the role description and your past projects</li>
+  <li>Prepare 2-3 thoughtful questions for the interviewer</li>
+  <li>Test your camera and microphone 5 minutes before</li>
+</ul>
+
+<p>Best of luck — we're rooting for you!</p>
+<p>Warm regards,<br>The Hiring Team</p>
+"""
+                )
+                print(f"[SCHEDULE] Confirmation email sent to {candidate['email']}")
+        except Exception as email_err:
+            print(f"[SCHEDULE] Candidate email error: {email_err}")
+
+        dt = datetime.fromisoformat(scheduled_at).strftime("%A, %B %d, %Y at %I:%M %p")
+        return HTMLResponse(_response_page(
+            "Scheduled",
+            "✓",
+            "#4ade80",
+            "Interview scheduled!",
+            f"""<p>The interview is confirmed for:</p>
+                <p style="font-size:18px;color:#eaeef6;font-weight:600;
+                  padding:14px;background:rgba(74,222,128,.08);border-radius:12px;
+                  border:1px solid rgba(74,222,128,.25)">
+                  📅 {dt}
+                </p>
+                <p>The candidate has been notified by email with the Teams meeting link.
+                Their resume and AI interview report will be available before the meeting.</p>"""
+        ))
+    except Exception as e:
+        return HTMLResponse(_response_page(
+            "Error", "✕", "#e0758a", "Something went wrong",
+            f"<p>{str(e)}</p>"
+        ), status_code=500)
+
+
+# ── 6. TALENT RESERVE — Send invite/offer/note email ─────────────────────
+class TalentReserveEmail(BaseModel):
+    candidate_id: str
+    candidate_email: str
+    candidate_name: str
+    action: str          # invite | offer | engage
+    subject: str
+    body: str
+
+@app.post("/api/talent-reserve/email")
+def send_reserve_email(req: TalentReserveEmail):
+    """Send a job invite, offer letter, or engagement note to a reserve candidate."""
+    try:
+        from agents.communicator.agent import send_email
+        from shared.cosmos_client import audit
+
+        # Convert plain-text body to HTML (preserve line breaks)
+        body_html = f"""
+<div style="font-family:Arial,sans-serif;font-size:14px;color:#1f2937;line-height:1.6;max-width:600px;margin:0 auto;padding:24px">
+{req.body.replace(chr(10), '<br>')}
+</div>
+"""
+
+        sent = send_email(
+            to_address=req.candidate_email,
+            subject=req.subject,
+            body_html=body_html,
+        )
+
+        # Audit trail
+        audit(req.candidate_id, "HR", f"reserve_{req.action}", {
+            "subject": req.subject,
+            "to": req.candidate_email,
+            "sent": sent,
+        })
+
+        if not sent:
+            raise HTTPException(status_code=500, detail="Email send failed via ACS")
+
+        return {"success": True, "sent_to": req.candidate_email}
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+# ── 7. TALENT RESERVE — Fast-track to pipeline ───────────────────────────
+class FastTrackRequest(BaseModel):
+    candidate_id: str
+    job_id: str
+
+@app.post("/api/talent-reserve/fast-track")
+def fast_track_to_pipeline(req: FastTrackRequest):
+    """Move a reserve candidate directly into a new job's pipeline,
+    skipping resume screening (they've already been pre-validated)."""
+    try:
+        from shared.cosmos_client import (
+            get_candidate, get_job, update_candidate, audit
+        )
+        candidate = get_candidate(req.candidate_id)
+        job       = get_job(req.job_id)
+        if not candidate or not job:
+            raise HTTPException(status_code=404, detail="Candidate or job not found")
+
+        # Move them into the new job's pipeline at the AI-interview stage
+        update_candidate(req.candidate_id, {
+            "job_id": req.job_id,
+            "applied_role": job.get("title"),
+            "status": "ai_interview_pending",   # skip resume screening
+            "fast_tracked": True,
+            "fast_tracked_at": datetime.utcnow().isoformat(),
+            "fast_tracked_from_reserve": True,
+        })
+        # Send AI interview invite for the new role
+        try:
+            from agents.communicator.agent import send_email
+            send_email(
+                to_address=candidate.get("email", ""),
+                subject=f"Great news! New opportunity at our company — {job.get('title','New Role')}",
+                body_html=f"""
+<p>Hi {candidate.get('name','there')},</p>
+<p>Thank you for your patience. We have a new opportunity that closely matches
+your profile: <strong>{job.get('title','')}</strong>.</p>
+<p>Since you've already been through our screening, we'd like to move you
+straight to the AI interview round. You'll receive the interview link shortly.</p>
+<p>Warm regards,<br>The Hiring Team</p>
+""",
+            )
+        except Exception as email_err:
+            print(f"[FAST-TRACK] Email error: {email_err}")
+        audit(req.candidate_id, "HR", "fast_track",
+              {"to_job_id": req.job_id, "to_job": job.get("title")})
+
+        # TODO: trigger AI interview invitation email
+        # from agents.aria_interviewer import send_interview_invite
+        # send_interview_invite(candidate, job)
+
+        return {"success": True, "candidate_id": req.candidate_id, "job_id": req.job_id}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
 
 @app.post("/api/assignments/{assignment_id}/custom-assign")
 def custom_assign(assignment_id: str,
@@ -1058,13 +1588,22 @@ from shared.agent_feed import get_feed, log_agent
 def agent_feed(limit: int = 50):
     return get_feed(limit)
 
-from fastapi.responses import HTMLResponse
-from pydantic import BaseModel
+
 
 # ── Interviewer Scoring ──────────────────────────────────────────
 
 @app.get("/interview/score/{assignment_id}", response_class=HTMLResponse)
-def scoring_page(assignment_id: str):
+def scoring_page(assignment_id: str, token: str = ""):
+    from shared.tokens import verify_token
+    if not verify_token("score", assignment_id, token):
+        return HTMLResponse("""
+        <div style="font-family:Segoe UI,sans-serif;max-width:500px;
+          margin:80px auto;text-align:center">
+          <div style="font-size:48px">🔒</div>
+          <h2>Invalid or Expired Link</h2>
+          <p style="color:#64748b">This scoring link is not valid.
+          Please check your email for the correct link.</p>
+        </div>""", status_code=403)
     """Serve the interviewer scoring form."""
     from shared.cosmos_client import get_assignment, get_candidate
     assignment = get_assignment(assignment_id)
@@ -1726,6 +2265,33 @@ def _send_talent_pool_email(candidate: dict, notes: str = ""):
 </div>
 """)
 
+# ── Daily Digest ─────────────────────────────────────────────────
+
+@app.post("/api/send-digest")
+def trigger_digest(hr_id: str = None):
+    """Manually trigger daily digest. Also called by scheduler at 8 AM."""
+    from shared.daily_digest import send_daily_digest
+    result = send_daily_digest(hr_id)
+    return result
+
+@app.get("/api/send-digest/test")
+def test_digest():
+    """Test endpoint — sends digest right now to all HR users."""
+    from shared.daily_digest import send_daily_digest
+    result = send_daily_digest()
+    return result
+
+@app.delete("/api/jobs/{job_id}")
+def delete_job_endpoint(job_id: str):
+    """Permanently delete a closed job."""
+    try:
+        from shared.cosmos_client import delete_job
+        result = delete_job(job_id)
+        if not result:
+            raise HTTPException(status_code=404, detail="Job not found")
+        return {"success": True, "job_id": job_id}
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
 # ── Run Server ───────────────────────────────────────────────────
 if __name__ == "__main__":
     uvicorn.run(

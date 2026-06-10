@@ -3,8 +3,14 @@ from shared.config import config
 from datetime import datetime
 import time
 
-_client = CosmosClient(config.COSMOS_ENDPOINT, config.COSMOS_KEY)
-_db     = _client.get_database_client(config.COSMOS_DATABASE)
+try:
+    _client = CosmosClient(config.COSMOS_ENDPOINT, config.COSMOS_KEY)
+    _db     = _client.get_database_client(config.COSMOS_DATABASE)
+    print("[DB] CosmosDB connected")
+except Exception as e:
+    print(f"[DB] CosmosDB connection failed: {e}")
+    _client = None
+    _db     = None
 
 def col(name):
     return _db.get_container_client(name)
@@ -58,11 +64,26 @@ def update_job(job_id: str, updates: dict) -> dict:
     col("jobs").upsert_item(job)
     return job
 
-def get_active_jobs() -> list:
-    q = "SELECT * FROM c WHERE c.status = 'active'"
-    return list(col("jobs").query_items(
-        query=q, enable_cross_partition_query=True))
-
+def get_active_jobs():
+    """Get all non-closed jobs."""
+    try:
+        query = "SELECT * FROM c WHERE c.status != 'closed' OR NOT IS_DEFINED(c.status)"
+        return list(col("jobs").query_items(
+            query=query,
+            enable_cross_partition_query=True
+        ))
+    except Exception as e:
+        print(f"Error fetching jobs: {e}")
+        return []
+    
+def get_all_jobs():
+    """Get all jobs including closed (for dashboard)."""
+    try:
+        return list(col("jobs").read_all_items())
+    except Exception as e:
+        print(f"Error fetching all jobs: {e}")
+        return []
+        
 # ── HR User Operations ───────────────────────────────────────────
 def save_hr_user(hr: dict):
     col("hr_users").upsert_item(hr)
@@ -154,6 +175,26 @@ def update_assignment(aid: str, updates: dict) -> dict:
     a.update(updates)
     col("interview_assignments").upsert_item(a)
     return a
+
+def update_job_status(job_id: str, status: str):
+    """Update job status (active/closed)."""
+    try:
+        job = col("jobs").read_item(job_id, partition_key=job_id)
+        job["status"] = status
+        col("jobs").upsert_item(job)
+        return job
+    except Exception as e:
+        print(f"Error updating job {job_id}: {e}")
+        return None
+    
+def delete_job(job_id: str):
+    """Permanently remove a job from CosmosDB."""
+    try:
+        col("jobs").delete_item(item=job_id, partition_key=job_id)
+        return True
+    except Exception as e:
+        print(f"[COSMOS] delete_job error: {e}")
+        return None
 
 def add_assignment_timeline(aid: str,
                              event: str,
