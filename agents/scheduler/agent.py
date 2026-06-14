@@ -1,3 +1,18 @@
+"""
+agents/scheduler/agent.py
+
+UPDATED: Now injects ARIA's comprehensive AI interview briefing into the
+interviewer assignment email. Everything else preserved:
+  - Teams meeting creation
+  - Resume PDF attachment
+  - HR decision form link
+  - Evaluation submission link
+  - Candidate notification email
+
+Backwards-compatible: if a candidate doesn't have the new `interview_briefing`
+field, falls back to the legacy `ai_profile.human_interview_briefing` structure.
+"""
+
 import msal
 import requests
 import json
@@ -235,6 +250,52 @@ def run_scheduler(candidate_id: str,
     if send_candidate_email:
         _send_interview_invite(candidate, slot_str, meeting_url, interview_type)
 
+    # ── AUTO-DISCOVER INTERVIEWER EMAIL if not provided ──
+    if not interviewer_email:
+        try:
+            from shared.cosmos_client import get_all_interviewers
+            all_iv = get_all_interviewers() or []
+
+            # Prefer interviewers matching the type, fall back to anyone
+            wanted_type = "hr_round" if interview_type != "technical" else "technical"
+            preferred = [
+                iv for iv in all_iv
+                if iv.get("email") and (
+                    wanted_type in (iv.get("roles") or [])
+                    or iv.get("interview_type") == wanted_type
+                    or iv.get("can_do_hr") if interview_type != "technical" else iv.get("can_do_technical")
+                )
+            ]
+            chosen = (preferred or all_iv)[0] if (preferred or all_iv) else None
+            if chosen:
+                interviewer_email = chosen.get("email", "")
+                interviewer_name  = chosen.get("name", "Interviewer")
+                print(f"[SCHEDULER] Auto-picked {interview_type} interviewer: {interviewer_email}")
+        except Exception as e:
+            print(f"[SCHEDULER] Interviewer auto-discovery failed: {e}")
+
+    # ── Auto-generate an assignment_id if missing, so the evaluation link works ──
+    if interviewer_email and not assignment_id:
+        try:
+            import uuid as _uuid
+            from shared.cosmos_client import save_assignment
+            assignment_id = str(_uuid.uuid4())
+            save_assignment({
+                "id": assignment_id,
+                "candidate_id": candidate_id,
+                "assigned_to": "auto",
+                "interview_type": interview_type if interview_type != "technical" else "technical",
+                "status": "scheduled",
+                "scheduled_at": slot.isoformat(),
+                "meeting_url": meeting_url,
+                "custom_assignee_email": interviewer_email,
+                "custom_assignee_name":  interviewer_name or "Interviewer",
+                "created_at": datetime.utcnow().isoformat(),
+            })
+            print(f"[SCHEDULER] Auto-created assignment {assignment_id[:8]}... for evaluation link")
+        except Exception as e:
+            print(f"[SCHEDULER] Could not create auto-assignment: {e}")
+
     if interviewer_email:
         _send_interviewer_invite(
             candidate, interviewer_name, interviewer_email,
@@ -298,6 +359,9 @@ thought process clearly, and prepare questions for the interviewer.</p>
         print(f"[SCHEDULER] Invite email error: {e}")
 
 
+# ═══════════════════════════════════════════════════════════════════════
+# UPDATED: _send_interviewer_invite now embeds the full ARIA briefing
+# ═══════════════════════════════════════════════════════════════════════
 def _send_interviewer_invite(candidate: dict,
                               interviewer_name: str,
                               interviewer_email: str,
@@ -305,132 +369,273 @@ def _send_interviewer_invite(candidate: dict,
                               meeting_url: str,
                               interview_type: str,
                               assignment_id: str = ""):
-    """Send interview details + candidate AI briefing + RESUME PDF to INTERVIEWER."""
-    from agents.communicator.agent import send_email, fetch_resume_attachment
+    """
+    Send interview details + AI briefing + resume PDF to INTERVIEWER.
 
-    # ── NEW: fetch the candidate's resume PDF for attachment ──
+    The briefing HTML comes from ARIA's `format_briefing_for_email()` and includes:
+      - Composite score + verdict badge
+      - 5-dimension scoring table
+      - Anti-cheat severity notes (if any)
+      - Strengths / concerns / red flags
+      - Resume validation table
+      - Focus areas for human round
+      - Already-tested skills (skip these)
+      - Suggested questions
+      - Collapsible full transcript
+    """
+    from agents.communicator.agent import send_email, fetch_resume_attachment
+    from shared.tokens import generate_token
+
+    # ── Fetch candidate's resume PDF for attachment ──
     resume_attachment = fetch_resume_attachment(candidate)
     attachments = [resume_attachment] if resume_attachment else None
 
-    ai_profile = candidate.get("ai_profile", {})
-    briefing = ai_profile.get("human_interview_briefing", {})
-    focus_on    = briefing.get("focus_on", [])
-    do_not_test = briefing.get("do_not_test_again", [])
-    suggestions = briefing.get("suggested_questions", [])
+    # ── Build the ARIA briefing HTML block ──
+    briefing_html = _build_briefing_html(candidate)
 
-    meeting_section = ""
+    # ── Meeting section ──
     if meeting_url:
         meeting_section = f"""
-<p><a href="{meeting_url}"
-   style="display:inline-block;background:#6366f1;color:#fff;
-   padding:12px 24px;text-decoration:none;border-radius:8px;
-   font-weight:bold">Join Teams Meeting →</a></p>
-"""
+<div style="background:#fff;border-radius:14px;padding:22px;margin:14px 0;
+border:1px solid #e2e8f0;text-align:center">
+  <p style="margin:0 0 14px;font-size:14px;color:#475569">
+    Click below to join the interview at the scheduled time.
+  </p>
+  <a href="{meeting_url}"
+     style="display:inline-block;background:linear-gradient(135deg,#6366f1,#4f46e5);
+            color:#fff;padding:14px 32px;text-decoration:none;border-radius:11px;
+            font-weight:700;font-size:15px">
+    Join Teams Meeting →
+  </a>
+</div>"""
     else:
         meeting_section = """
-<p>A calendar invite with the Teams meeting link will follow shortly.</p>
-"""
-
-    if interview_type == "hr":
-        decision_url = f"http://localhost:8000/hr/decision/{candidate.get('id','')}"
-        meeting_section += f"""
-<div style="margin-top:20px;padding:20px;background:#f8fafc;
-border-radius:12px;border:1px solid #e2e8f0">
-<p style="font-weight:700;color:#0f172a;margin:0 0 6px;font-size:15px">
-    After the HR Interview
-</p>
-<p style="color:#64748b;font-size:13px;margin:0 0 14px">
-    Once the interview is complete, use this form to send an offer,
-    decline, or add the candidate to the talent pool.
-</p>
-<a href="{decision_url}"
-    style="display:inline-block;background:linear-gradient(135deg,#6366f1,#7c3aed);
-    color:#fff;padding:14px 28px;text-decoration:none;border-radius:8px;
-    font-weight:700;font-size:14px">
-    📋 Open Decision Form →
-</a>
-<p style="color:#94a3b8;font-size:11px;margin:10px 0 0">
-    Options: Send Offer Letter · Decline · Add to Talent Pool
-</p>
+<div style="background:#fff;border-radius:14px;padding:22px;margin:14px 0;
+border:1px solid #e2e8f0;text-align:center">
+  <p style="margin:0;color:#64748b;font-size:14px">
+    A calendar invite with the Teams meeting link will follow shortly.
+  </p>
 </div>"""
 
-    # ── NEW: tell the interviewer the resume is attached (only if it actually is) ──
+    # ── HR decision form (only for HR interviews) ──
+    decision_section = ""
+    if interview_type == "hr":
+        decision_url = f"http://localhost:8000/hr/decision/{candidate.get('id','')}"
+        decision_section = f"""
+<div style="margin:14px 0;padding:22px;background:#fff;
+border-radius:14px;border:1px solid #e2e8f0">
+  <p style="font-weight:700;color:#0f172a;margin:0 0 6px;font-size:15px">
+    After the HR Interview
+  </p>
+  <p style="color:#64748b;font-size:13px;margin:0 0 14px">
+    Once the interview is complete, use this form to send an offer,
+    decline, or add the candidate to the talent pool.
+  </p>
+  <a href="{decision_url}"
+     style="display:inline-block;background:linear-gradient(135deg,#6366f1,#7c3aed);
+     color:#fff;padding:14px 28px;text-decoration:none;border-radius:11px;
+     font-weight:700;font-size:14px">
+    📋 Open Decision Form →
+  </a>
+  <p style="color:#94a3b8;font-size:11px;margin:10px 0 0">
+    Options: Send Offer Letter · Decline · Add to Talent Pool
+  </p>
+</div>"""
+
+    # ── Resume attached note ──
     resume_note_html = ""
     if resume_attachment:
         resume_note_html = """
-<div style="margin-top:18px;padding:14px 18px;background:#eef2ff;
+<div style="margin:14px 0;padding:14px 18px;background:#eef2ff;
 border-radius:10px;border-left:4px solid #6366f1">
-<p style="margin:0;color:#1e1b4b;font-size:13px">
-📎 <strong>Candidate's resume is attached</strong> to this email.
-Please review it before the interview to prepare targeted questions.
-</p>
+  <p style="margin:0;color:#1e1b4b;font-size:13px">
+    📎 <strong>Candidate's resume is attached</strong> to this email.
+    Please review it before the interview.
+  </p>
 </div>"""
 
-    focus_html     = "".join(f"<li>{f}</li>" for f in focus_on[:5]) if focus_on else "<li>Technical depth and culture fit</li>"
-    skip_html      = "".join(f"<li>{s}</li>" for s in do_not_test[:5]) if do_not_test else "<li>Basic skills already verified by AI</li>"
-    questions_html = "".join(f"<li>{q}</li>" for q in suggestions[:3]) if suggestions else ""
-
-    from shared.tokens import generate_token
+    # ── Evaluation submission link ──
     score_token = generate_token('score', assignment_id) if assignment_id else ''
-    score_url = f"http://localhost:8000/interview/score/{assignment_id}?token={score_token}" if assignment_id else "#"
+    score_url = (
+        f"http://localhost:8000/interview/score/{assignment_id}?token={score_token}"
+        if assignment_id else "#"
+    )
+    evaluation_section = f"""
+<div style="margin:14px 0;padding:22px;background:#fff;
+border-radius:14px;border:1px solid #e2e8f0;text-align:center">
+  <p style="font-weight:700;color:#0f172a;margin:0 0 6px;font-size:15px">
+    Submit Your Evaluation
+  </p>
+  <p style="color:#64748b;font-size:13px;margin:0 0 14px">
+    After the interview, score the candidate and leave your notes.
+  </p>
+  <a href="{score_url}"
+     style="display:inline-block;background:#0f172a;color:#fff;
+     padding:13px 28px;text-decoration:none;border-radius:11px;
+     font-weight:700;font-size:14px">
+    Submit Your Evaluation →
+  </a>
+</div>"""
+
+    # ── Pull AI score for the subject line ──
+    briefing_data = candidate.get("interview_briefing") or {}
+    ai_score = briefing_data.get("composite_score") or candidate.get("ai_interview_score")
+
+    subject = f"🎯 Interview Brief: {candidate.get('name')} — {candidate.get('applied_role', '')}"
+    if ai_score is not None:
+        subject += f" (AI Score: {ai_score}/100)"
+
+    # ── Build the full email body ──
+    body_html = f"""
+<div style="font-family:-apple-system,Segoe UI,Roboto,sans-serif;max-width:720px;
+margin:0 auto;background:#f1f5f9;padding:24px">
+
+  <!-- Header -->
+  <div style="background:#fff;border-radius:14px;padding:22px;margin-bottom:14px">
+    <div style="font-size:11px;color:#5b8def;font-weight:700;
+                text-transform:uppercase;letter-spacing:0.08em;margin-bottom:6px">
+      🎯 Interview Assignment
+    </div>
+    <h2 style="margin:0 0 6px;font-size:20px;color:#0f172a">
+      You've been invited to interview <strong>{candidate.get('name')}</strong>
+    </h2>
+    <div style="font-size:14px;color:#64748b">
+      Role: <strong style="color:#0f172a">{candidate.get('applied_role', '')}</strong>
+    </div>
+  </div>
+
+  <!-- Quick facts table -->
+  <div style="background:#fff;border-radius:14px;padding:22px;margin-bottom:14px">
+    <table style="border-collapse:collapse;width:100%;font-size:13px">
+      <tr>
+        <td style="padding:8px;color:#64748b;font-weight:600;width:140px">Date &amp; Time</td>
+        <td style="padding:8px;color:#0f172a">{slot_str}</td>
+      </tr>
+      <tr style="background:#f8fafc">
+        <td style="padding:8px;color:#64748b;font-weight:600">AI Interview Score</td>
+        <td style="padding:8px;color:#0f172a;font-weight:700">{ai_score or 'N/A'}/100</td>
+      </tr>
+      <tr>
+        <td style="padding:8px;color:#64748b;font-weight:600">Resume Score</td>
+        <td style="padding:8px;color:#0f172a">{candidate.get('resume_score', 'N/A')}/100</td>
+      </tr>
+    </table>
+  </div>
+
+  <!-- Meeting -->
+  {meeting_section}
+
+  <!-- Resume attached note -->
+  {resume_note_html}
+
+  <!-- ARIA's full AI interview briefing -->
+  {briefing_html}
+
+  <!-- HR decision form (only for HR interviews) -->
+  {decision_section}
+
+  <!-- Evaluation submission -->
+  {evaluation_section}
+
+  <!-- Footer -->
+  <div style="font-size:11px;color:#94a3b8;text-align:center;margin-top:18px">
+    Generated by HR Swarm · ARIA AI Interviewer
+  </div>
+
+</div>
+"""
 
     try:
         send_email(
             to_address=interviewer_email,
-            subject=f"Interview Assignment — {candidate.get('name')} | {candidate.get('applied_role', '')}",
-            body_html=f"""
-<h2>Interview Scheduled</h2>
-<p>Hi {interviewer_name},</p>
-<p>You have an interview scheduled:</p>
-
-<table style="border-collapse:collapse;width:100%;max-width:500px">
-<tr style="background:#f5f5f4">
-    <td style="padding:10px;font-weight:bold">Candidate</td>
-    <td style="padding:10px">{candidate.get('name')}</td>
-</tr>
-<tr>
-    <td style="padding:10px;font-weight:bold">Role</td>
-    <td style="padding:10px">{candidate.get('applied_role', '')}</td>
-</tr>
-<tr style="background:#f5f5f4">
-    <td style="padding:10px;font-weight:bold">Date & Time</td>
-    <td style="padding:10px">{slot_str}</td>
-</tr>
-<tr>
-    <td style="padding:10px;font-weight:bold">AI Score</td>
-    <td style="padding:10px">{candidate.get('ai_interview_score', 'N/A')}/100</td>
-</tr>
-<tr style="background:#f5f5f4">
-    <td style="padding:10px;font-weight:bold">Resume Score</td>
-    <td style="padding:10px">{candidate.get('resume_score', 'N/A')}/100</td>
-</tr>
-</table>
-
-{meeting_section}
-
-{resume_note_html}
-
-<h3>AI Interview Briefing</h3>
-<p><strong>Focus your interview on:</strong></p>
-<ul>{focus_html}</ul>
-
-<p><strong>Already tested by AI (skip these):</strong></p>
-<ul>{skip_html}</ul>
-
-{"<p><strong>Suggested questions:</strong></p><ul>" + questions_html + "</ul>" if questions_html else ""}
-
-<p style="margin-top:24px"><strong>After the interview, submit your evaluation:</strong></p>
-<a href="{score_url}"
-   style="display:inline-block;background:#6366f1;color:#fff;padding:12px 28px;
-   text-decoration:none;border-radius:8px;font-weight:bold">
-   Submit Your Evaluation →
-</a>
-
-<p>Thank you,<br>HR Team</p>
-""",
-            attachments=attachments,   # ← NEW: resume PDF goes here
+            subject=subject,
+            body_html=body_html,
+            attachments=attachments,
         )
         print(f"[SCHEDULER] Interviewer invite sent to {interviewer_email}"
-              + (" with resume attached" if resume_attachment else " (no resume attached)"))
+              + (" with resume + AI briefing" if resume_attachment else " (no resume)"))
     except Exception as e:
         print(f"[SCHEDULER] Interviewer invite error: {e}")
+
+
+def _build_briefing_html(candidate: dict) -> str:
+    """
+    Build the AI briefing HTML block for the interviewer email.
+
+    Priority:
+      1. NEW structure: candidate.interview_briefing — produced by ARIA agent.
+         Renders via format_briefing_for_email() (rich 5-dimension report).
+      2. LEGACY structure: candidate.ai_profile.human_interview_briefing.
+         Renders via _legacy_briefing_html() (simpler bullet list).
+      3. NEITHER: skip the section gracefully.
+    """
+    # 1. Try NEW briefing structure (from ARIA agent)
+    new_briefing = candidate.get("interview_briefing")
+    if new_briefing and isinstance(new_briefing, dict):
+        try:
+            from agents.aria_interviewer.briefing_generator import format_briefing_for_email
+            return format_briefing_for_email(new_briefing)
+        except ImportError:
+            print("[SCHEDULER] aria_interviewer not installed — falling back to legacy briefing format")
+        except Exception as e:
+            print(f"[SCHEDULER] format_briefing_for_email failed: {e}")
+
+    # 2. Legacy fallback
+    legacy = (candidate.get("ai_profile") or {}).get("human_interview_briefing")
+    if legacy:
+        return _legacy_briefing_html(legacy)
+
+    # 3. Nothing to render
+    return ""
+
+
+def _legacy_briefing_html(briefing: dict) -> str:
+    """Old briefing format — kept for backward compat with pre-ARIA candidates."""
+    focus_on    = briefing.get("focus_on", [])
+    do_not_test = briefing.get("do_not_test_again", [])
+    suggestions = briefing.get("suggested_questions", [])
+
+    focus_html = (
+        "".join(f"<li style='margin-bottom:6px;color:#1e40af'>→ {f}</li>" for f in focus_on[:5])
+        if focus_on else
+        "<li style='color:#64748b'>Technical depth and culture fit</li>"
+    )
+    skip_html = (
+        "".join(f"<li style='margin-bottom:6px;color:#475569'>✓ {s}</li>" for s in do_not_test[:5])
+        if do_not_test else
+        "<li style='color:#64748b'>Basic skills already verified by AI</li>"
+    )
+    questions_section = ""
+    if suggestions:
+        items = "".join(f"<li style='margin-bottom:6px;color:#1e40af'>→ {q}</li>" for q in suggestions[:3])
+        questions_section = f"""
+<div style="margin:14px 0">
+  <div style="font-size:12px;font-weight:700;color:#0f172a;text-transform:uppercase;letter-spacing:0.06em;margin-bottom:6px">
+    💡 Suggested Questions
+  </div>
+  <ul style="margin:0;padding-left:4px;list-style:none">{items}</ul>
+</div>"""
+
+    return f"""
+<div style="background:#fff;border:1px solid #e2e8f0;border-radius:14px;padding:24px;margin:14px 0">
+  <div style="font-size:11px;color:#5b8def;font-weight:700;text-transform:uppercase;letter-spacing:0.08em;margin-bottom:10px">
+    🤖 AI Interview Briefing (legacy format)
+  </div>
+
+  <div style="margin:14px 0">
+    <div style="font-size:12px;font-weight:700;color:#0f172a;text-transform:uppercase;letter-spacing:0.06em;margin-bottom:6px">
+      🎯 Focus your interview on
+    </div>
+    <ul style="margin:0;padding-left:4px;list-style:none">{focus_html}</ul>
+  </div>
+
+  <div style="margin:14px 0">
+    <div style="font-size:12px;font-weight:700;color:#0f172a;text-transform:uppercase;letter-spacing:0.06em;margin-bottom:6px">
+      ✓ Already tested by AI (skip these)
+    </div>
+    <ul style="margin:0;padding-left:4px;list-style:none">{skip_html}</ul>
+  </div>
+
+  {questions_section}
+</div>
+"""

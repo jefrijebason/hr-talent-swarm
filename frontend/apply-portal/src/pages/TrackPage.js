@@ -12,6 +12,10 @@ function buildStages(candidate, job) {
   const mode   = job?.interview_mode || 'standard';
   const stages = [];
 
+  // Treat either flag as Vibe Engineering enabled (Option B unified flow)
+  const vibeEnabled = job?.coding_assessment_enabled || job?.coding_round_enabled
+    || ['vibe_engineering_sent','vibe_engineering_in_progress','vibe_engineering_passed','vibe_engineering_complete'].includes(status);
+
   // Stage 1 — Always: Applied
   stages.push({
     key: 'applied', label: 'Application Received', icon: '📥',
@@ -24,9 +28,17 @@ function buildStages(candidate, job) {
     statuses: ['screened']
   });
 
+  // Stage 3 (NEW position) — Vibe Engineering Challenge, BEFORE AI Interview
+  if (vibeEnabled) {
+    stages.push({
+      key: 'vibe', label: 'Vibe Engineering Challenge', icon: '🛠️',
+      statuses: ['vibe_engineering_sent', 'vibe_engineering_in_progress',
+                 'vibe_engineering_passed', 'vibe_engineering_complete']
+    });
+  }
+
   // Mode-specific stages
   if (mode === 'executive') {
-    // Executive: Skip AI, go straight to human rounds
     const humanRounds = job?.human_rounds || [];
     humanRounds.forEach((r, i) => {
       stages.push({
@@ -43,18 +55,11 @@ function buildStages(candidate, job) {
       });
     }
   } else if (mode === 'express') {
-    // Express: AI Interview → Single Combined Human Round
     if (job?.ai_interview_enabled !== false) {
       stages.push({
         key: 'ai_interview', label: 'AI Interview', icon: '🤖',
         statuses: ['ai_interview_sent', 'ai_interview_accepted',
                    'ai_interview_in_progress', 'ai_interview_complete']
-      });
-    }
-    if (job?.coding_round_enabled || ['coding_sent', 'coding_complete'].includes(status)) {
-      stages.push({
-        key: 'coding', label: 'Coding Assessment', icon: '💻',
-        statuses: ['coding_sent', 'coding_complete']
       });
     }
     stages.push({
@@ -62,18 +67,11 @@ function buildStages(candidate, job) {
       statuses: ['waiting_technical_interview', 'waiting_hr_interview']
     });
   } else if (mode === 'custom') {
-    // Custom: Build from job config
     if (job?.ai_interview_enabled !== false) {
       stages.push({
         key: 'ai_interview', label: 'AI Interview', icon: '🤖',
         statuses: ['ai_interview_sent', 'ai_interview_accepted',
                    'ai_interview_in_progress', 'ai_interview_complete']
-      });
-    }
-    if (job?.coding_round_enabled || ['coding_sent', 'coding_complete'].includes(status)) {
-      stages.push({
-        key: 'coding', label: 'Coding Assessment', icon: '💻',
-        statuses: ['coding_sent', 'coding_complete']
       });
     }
     const humanRounds = job?.human_rounds || [];
@@ -107,12 +105,6 @@ function buildStages(candidate, job) {
                    'ai_interview_in_progress', 'ai_interview_complete']
       });
     }
-    if (job?.coding_round_enabled || ['coding_sent', 'coding_complete'].includes(status)) {
-      stages.push({
-        key: 'coding', label: 'Coding Assessment', icon: '💻',
-        statuses: ['coding_sent', 'coding_complete']
-      });
-    }
     stages.push({
       key: 'technical', label: 'Technical Interview', icon: '👤',
       statuses: ['waiting_technical_interview']
@@ -135,76 +127,58 @@ function buildStages(candidate, job) {
 // ── Find which stage the candidate is at ─────────────────────────
 function getCurrentStageIndex(stages, status) {
   if (!status) return 0;
-
-  // Special: hired goes to final stage
-  if (status === 'hired') {
-    return stages.length - 1;
-  }
-
+  if (status === 'hired') return stages.length - 1;
   for (let i = stages.length - 1; i >= 0; i--) {
     if (stages[i].statuses.includes(status)) return i;
   }
-
-  // Fallback: check partial matches
   for (let i = stages.length - 1; i >= 0; i--) {
     if (stages[i].statuses.some(s =>
       status.includes(s) || s.includes(status))) return i;
   }
-
   return 0;
 }
 
 function getRejectedStageIndex(stages, candidate, job) {
   if (!candidate || candidate.status !== 'rejected') return stages.length - 1;
+  if (candidate.final_score !== undefined) return stages.length - 1;
 
-  // If the pipeline actually reached the final decision, keep the full stage timeline.
-  if (candidate.final_score !== undefined) {
-    return stages.length - 1;
-  }
-
-  // If the candidate has reached AI evaluation, assume rejection occurred there.
   if (candidate.ai_interview_score !== undefined) {
     const idx = stages.findIndex(s => s.key === 'ai_interview');
     return idx >= 0 ? idx : 1;
   }
-
-  // If the candidate completed coding before rejection, stop at coding.
-  if (candidate.coding_score !== undefined) {
-    const idx = stages.findIndex(s => s.key === 'coding');
+  if (candidate.vibe_engineering_score !== undefined) {
+    const idx = stages.findIndex(s => s.key === 'vibe');
     return idx >= 0 ? idx : 1;
   }
-
-  // If the candidate has only resume data, reject at screening.
   if (candidate.resume_score !== undefined) {
     const idx = stages.findIndex(s => s.key === 'screened');
     return idx >= 0 ? idx : 1;
   }
-
-  // Fallback to the applied stage if no other evidence exists.
   return 0;
 }
 
 // ── Status message per stage ─────────────────────────────────────
 function getStatusMessage(status) {
   const messages = {
-    'applied':                    'Your application is being processed',
-    'screened':                   'Resume reviewed — preparing next step',
-    'ai_interview_sent':          'AI interview link sent to your email — complete within 3 days',
-    'ai_interview_accepted':      'Interview link ready — take it at your convenience',
-    'ai_interview_in_progress':   'AI interview in progress',
-    'ai_interview_complete':      'AI interview complete — being evaluated',
-    'coding_sent':                'Coding assessment sent to your email',
-    'coding_complete':            'Coding assessment complete',
-    'waiting_technical_interview': 'Technical interview scheduled',
-    'waiting_hr_interview':       'Technical passed — HR round next',
-    'evaluating':                 'Final evaluation in progress',
-    'hired':                      'Congratulations! Offer sent to your email',
-    'rejected':                   'This role wasn\'t a match this time',
+    'applied':                       'Your application is being processed',
+    'screened':                      'Resume reviewed — preparing next step',
+    'vibe_engineering_sent':         'Coding challenge link sent to your email — complete within 3 days',
+    'vibe_engineering_in_progress':  'Coding challenge in progress',
+    'vibe_engineering_passed':       'Coding challenge passed — preparing AI interview',
+    'vibe_engineering_complete':     'Coding challenge complete — being evaluated',
+    'ai_interview_sent':             'AI interview link sent to your email — complete within 3 days',
+    'ai_interview_accepted':         'Interview link ready — take it at your convenience',
+    'ai_interview_in_progress':      'AI interview in progress',
+    'ai_interview_complete':         'AI interview complete — being evaluated',
+    'waiting_technical_interview':   'Technical interview scheduled',
+    'waiting_hr_interview':          'Technical passed — HR round next',
+    'evaluating':                    'Final evaluation in progress',
+    'hired':                         'Congratulations! Offer sent to your email',
+    'rejected':                      'This role wasn\'t a match this time',
   };
   return messages[status] || 'Processing...';
 }
 
-// ── Rejection stage label ────────────────────────────────────────
 function getRejectionStage(status, stages, stageIdx) {
   if (status !== 'rejected') return null;
   if (stageIdx > 0 && stageIdx < stages.length - 1) {
@@ -268,7 +242,6 @@ export default function TrackPage({ initialQuery = '' }) {
         setCandidate(result);
         setLastUpdate(new Date().toLocaleTimeString());
 
-        // Fetch job config for pipeline stages
         if (result.job_id) {
           try {
             const jr = await axios.get(`${API_URL}/api/jobs/${result.job_id}`);
@@ -297,15 +270,9 @@ export default function TrackPage({ initialQuery = '' }) {
   const isComplete   = isRejected || isHired;
   const rejectedIdx  = isRejected ? getRejectedStageIndex(stages, candidate, job) : stageIdx;
 
-  // Only show stages up to the current stage, and if still active show the next upcoming stage.
   const visibleStages = stages.filter((_, i) => {
-    if (isRejected) {
-      // Hide all stages beyond the rejection point.
-      return i <= rejectedIdx;
-    }
-    if (isComplete) {
-      return i <= stageIdx;
-    }
+    if (isRejected) return i <= rejectedIdx;
+    if (isComplete) return i <= stageIdx;
     return i <= stageIdx + 1;
   });
 
@@ -380,11 +347,14 @@ export default function TrackPage({ initialQuery = '' }) {
               )}
             </div>
 
-            {/* Scores (only show what exists) */}
-            {(candidate.resume_score || candidate.ai_interview_score) && (
+            {/* Scores */}
+            {(candidate.resume_score || candidate.vibe_engineering_score || candidate.ai_interview_score) && (
               <div style={{ display: 'flex', gap: '10px', marginBottom: '20px' }}>
                 {candidate.resume_score && (
                   <ScoreCard label="Resume" value={candidate.resume_score} />
+                )}
+                {candidate.vibe_engineering_score && (
+                  <ScoreCard label="Vibe Eng." value={candidate.vibe_engineering_score} />
                 )}
                 {candidate.ai_interview_score && (
                   <ScoreCard label="AI Interview" value={candidate.ai_interview_score} />
@@ -431,13 +401,11 @@ export default function TrackPage({ initialQuery = '' }) {
 
             {/* Dynamic Timeline */}
             <div style={{ position: 'relative', paddingLeft: '36px' }}>
-              {/* Background line */}
               {visibleStages.length > 1 && (
                 <div style={{ position: 'absolute', left: '15px', top: '12px',
                   bottom: '12px', width: '2px', background: 'rgba(255,255,255,0.06)' }} />
               )}
 
-              {/* Progress line */}
               {visibleStages.length > 1 && (
                 <motion.div
                   initial={{ height: 0 }}
@@ -486,7 +454,6 @@ export default function TrackPage({ initialQuery = '' }) {
                         ? '0 0 16px rgba(124,108,246,0.5)' : 'none' }}>
                       {done ? '✓' : isRejectedHere ? '✗' : stage.icon}
 
-                      {/* Pulsing ring on current (non-rejected) */}
                       {current && !isComplete && (
                         <motion.div
                           animate={{ scale: [1, 1.6], opacity: [0.6, 0] }}
@@ -509,6 +476,11 @@ export default function TrackPage({ initialQuery = '' }) {
                     {done && stage.key === 'screened' && candidate.resume_score && (
                       <div style={{ fontSize: '13px', color: theme.success }}>
                         Score: {candidate.resume_score}/100
+                      </div>
+                    )}
+                    {done && stage.key === 'vibe' && candidate.vibe_engineering_score && (
+                      <div style={{ fontSize: '13px', color: theme.success }}>
+                        Score: {candidate.vibe_engineering_score}/100
                       </div>
                     )}
                     {done && stage.key === 'ai_interview' && candidate.ai_interview_score && (
@@ -557,7 +529,6 @@ export default function TrackPage({ initialQuery = '' }) {
               </div>
             )}
 
-            {/* Last updated */}
             {lastUpdate && (
               <div style={{ marginTop: '12px', fontSize: '11px',
                 color: theme.textMuted, textAlign: 'center' }}>
@@ -572,7 +543,6 @@ export default function TrackPage({ initialQuery = '' }) {
   );
 }
 
-// ── Score Card ────────────────────────────────────────────────────
 function ScoreCard({ label, value }) {
   return (
     <div style={{ flex: 1, background: 'rgba(255,255,255,0.03)',

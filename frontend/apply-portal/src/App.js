@@ -9,6 +9,7 @@ import JobDetailPage from './pages/JobDetailPage';
 import ApplyPage from './pages/ApplyPage';
 import TrackPage from './pages/TrackPage';
 import InterviewPage from './interview/InterviewPage';
+import VibeEngineeringPage from './vibe/VibeEngineeringPage';   // ← NEW
 
 export default function App() {
   const [page, setPage]             = useState('browse');
@@ -16,10 +17,25 @@ export default function App() {
   const [selectedJob, setJob]       = useState(null);
   const [successData, setSuccessData] = useState(null);
   const [interviewData, setInterviewData] = useState(null);
+  const [vibeData, setVibeData] = useState(null);                // ← NEW
 
-  // Check URL for interview token on load
+  // Check URL for interview/vibe token on load
   useEffect(() => {
     const params = new URLSearchParams(window.location.search);
+
+    // ── Check for Vibe Engineering Challenge first ──            ← NEW
+    const vibeToken = params.get('vibe');
+    if (vibeToken) {
+      setVibeData({
+        token: vibeToken,
+        candidateName: decodeURIComponent(params.get('name') || 'Candidate'),
+        roleName:      decodeURIComponent(params.get('role') || 'this role'),
+      });
+      setPage('vibe');
+      return;
+    }
+
+    // ── Existing: AI interview ──
     const token = params.get('interview');
     const name  = params.get('name') || 'Candidate';
     const role  = params.get('role') || 'this role';
@@ -58,6 +74,16 @@ export default function App() {
     setTimeout(() => confetti({ particleCount: 50, angle: 120,
       spread: 55, origin: { x: 1 }, colors }), 400);
   };
+
+  // ── Vibe Engineering page has its own layout — no nav ──       ← NEW
+  if (page === 'vibe' && vibeData) {
+    return (
+      <VibeEngineeringPage
+        candidateId={vibeData.token}
+        candidateName={vibeData.candidateName}
+      />
+    );
+  }
 
   // Interview page has its own layout — no nav
   if (page === 'interview' && interviewData) {
@@ -173,6 +199,7 @@ function SuccessPage({ data, onTrack, onBrowse }) {
           </div>
           {[
             '🤖 AI reviews your resume within 1 hour',
+            '🛠️ Vibe Engineering Challenge link (if coding role)',
             '🎯 AI interview link sent to your email',
             '👤 Human interview if shortlisted',
             '📧 Offer or detailed feedback within 3 days',

@@ -172,36 +172,513 @@ function JourneyTimeline({ candidate }) {
 }
 
 /* ════════════════════════════════════════════════════════════════════
-   AI INTERVIEW SUMMARY  — shows transcript highlights if available
+   AI INTERVIEW SUMMARY  — ARIA briefing (5-dimension + anti-cheat + transcript)
+   Reads from candidate.interview_briefing (new ARIA structure)
+   Falls back to legacy candidate.ai_summary / interview_answers fields.
 ════════════════════════════════════════════════════════════════════ */
+
+/* Dimension metadata for display */
+const DIMENSIONS_META = [
+  { key: 'first_principles', label: 'First Principles',  desc: 'Questioning assumptions',  icon: '◆' },
+  { key: 'ai_fluency',       label: 'AI Fluency',         desc: 'Using AI as force multiplier', icon: '⚡' },
+  { key: 'decomposition',    label: 'Decomposition',      desc: 'Breaking down problems',   icon: '◫' },
+  { key: 'taste',            label: 'Taste',              desc: 'Picking good vs great',    icon: '✦' },
+  { key: 'verification',     label: 'Verification',       desc: 'Catching AI mistakes',     icon: '✓' },
+];
+
+/* Verdict styling */
+const VERDICT_STYLES = {
+  STRONG_PASS: { bg: 'rgba(74,222,128,.12)',  border: 'rgba(74,222,128,.4)',  color: '#4ade80', label: 'STRONG PASS' },
+  PASS:        { bg: 'rgba(91,141,239,.12)',  border: 'rgba(91,141,239,.4)',  color: '#5b8def', label: 'PASS'        },
+  MARGINAL:    { bg: 'rgba(216,184,120,.12)', border: 'rgba(216,184,120,.4)', color: '#d8b878', label: 'MARGINAL'    },
+  FAIL:        { bg: 'rgba(224,117,138,.12)', border: 'rgba(224,117,138,.4)', color: '#e0758a', label: 'FAIL'        },
+};
+
+/* Anti-cheat severity styling */
+const SEVERITY_STYLES = {
+  none:   { bg: 'rgba(74,222,128,.1)',  color: '#4ade80', label: 'Clean'  },
+  low:    { bg: 'rgba(109,180,240,.1)', color: '#6db4f0', label: 'Low'    },
+  medium: { bg: 'rgba(216,184,120,.1)', color: '#d8b878', label: 'Medium' },
+  high:   { bg: 'rgba(224,117,138,.1)', color: '#e0758a', label: 'High'   },
+};
+
 function AIInterviewSummary({ candidate }) {
-  const summary   = candidate.ai_summary || candidate.interview_summary;
-  const answers   = candidate.interview_answers || candidate.key_answers || [];
-  const strengths = candidate.strengths || [];
-  const concerns  = candidate.concerns  || [];
+  const [showTranscript, setShowTranscript] = useState(false);
 
-  if (!summary && answers.length === 0 && strengths.length === 0) return null;
+  // ── 1. NEW briefing (preferred) ──
+  const briefing = candidate.interview_briefing;
 
+  // ── 2. LEGACY fallback ──
+  const legacySummary   = candidate.ai_summary || candidate.interview_summary;
+  const legacyAnswers   = candidate.interview_answers || candidate.key_answers || [];
+  const legacyStrengths = candidate.strengths || [];
+  const legacyConcerns  = candidate.concerns  || [];
+
+  // If NEITHER source has data, render nothing
+  const hasNewBriefing = briefing && (briefing.composite_score !== undefined || briefing.summary);
+  const hasLegacyData  = legacySummary || legacyAnswers.length > 0 || legacyStrengths.length > 0;
+  if (!hasNewBriefing && !hasLegacyData) return null;
+
+  // If only LEGACY data is available, render the simpler legacy view
+  if (!hasNewBriefing && hasLegacyData) {
+    return <LegacyAISummary
+      summary={legacySummary} answers={legacyAnswers}
+      strengths={legacyStrengths} concerns={legacyConcerns} />;
+  }
+
+  // ── 3. NEW briefing view ──
+  const verdict     = briefing.verdict || (briefing.passed ? 'PASS' : 'FAIL');
+  const vStyle      = VERDICT_STYLES[verdict] || VERDICT_STYLES.PASS;
+  const compScore   = briefing.composite_score || 0;
+  const passThresh  = briefing.pass_threshold || 70;
+  const dimensions  = briefing.dimension_scores || {};
+  const weights     = briefing.weights || {};
+  const antiCheat   = briefing.anti_cheat || {};
+  const severity    = antiCheat.severity || 'none';
+  const sStyle      = SEVERITY_STYLES[severity] || SEVERITY_STYLES.none;
+  const flags       = antiCheat.flags || [];
+  const flagCount   = antiCheat.flag_count || 0;
+  const strengths   = briefing.strengths   || [];
+  const concerns    = briefing.concerns    || [];
+  const redFlags    = briefing.red_flags   || [];
+  const focusOn     = briefing.focus_on    || [];
+  const alreadyTested  = briefing.do_not_test_again   || [];
+  const suggestedQs    = briefing.suggested_questions || [];
+  const resumeValid    = briefing.resume_validation   || [];
+  const transcript     = briefing.transcript || [];
+
+  return (
+    <div style={{ marginBottom: 24 }}>
+      <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between',
+        marginBottom: 12 }}>
+        <div style={{ fontSize: 12, fontWeight: 600, color: 'var(--tx)',
+          letterSpacing: '0.1em', textTransform: 'uppercase',
+          fontFamily: 'JetBrains Mono' }}>
+          ARIA Interview Report
+        </div>
+        <div style={{ fontSize: 10, color: 'var(--tx3)',
+          fontFamily: 'JetBrains Mono', letterSpacing: '0.06em' }}>
+          {briefing.questions_asked || 0} questions ·
+          {' '}{Math.round(briefing.duration_minutes || 0)} min
+        </div>
+      </div>
+
+      {/* ── Verdict + Composite Score ── */}
+      <div style={{
+        background: vStyle.bg, border: `1px solid ${vStyle.border}`,
+        borderRadius: 14, padding: 18, marginBottom: 14,
+        display: 'flex', alignItems: 'center', gap: 18,
+      }}>
+        <div style={{ position: 'relative', flexShrink: 0 }}>
+          <div style={{
+            width: 64, height: 64, borderRadius: '50%',
+            background: `conic-gradient(${vStyle.color} ${compScore * 3.6}deg, var(--pan2) 0)`,
+            display: 'grid', placeItems: 'center',
+          }}>
+            <div style={{
+              width: 52, height: 52, borderRadius: '50%',
+              background: 'var(--pan)', display: 'grid', placeItems: 'center',
+            }}>
+              <div style={{ textAlign: 'center' }}>
+                <div style={{ fontSize: 18, fontWeight: 800, color: vStyle.color,
+                  fontFamily: 'JetBrains Mono', lineHeight: 1 }}>
+                  {compScore}
+                </div>
+                <div style={{ fontSize: 8, color: 'var(--tx3)',
+                  fontFamily: 'JetBrains Mono', marginTop: 2 }}>
+                  /100
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <div style={{ flex: 1 }}>
+          <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 4 }}>
+            <span style={{
+              fontFamily: 'JetBrains Mono', fontSize: 10, fontWeight: 700,
+              letterSpacing: '0.1em', padding: '4px 10px', borderRadius: 6,
+              background: vStyle.color + '22', color: vStyle.color,
+              border: `1px solid ${vStyle.border}`,
+            }}>
+              {vStyle.label}
+            </span>
+            <span style={{ fontSize: 11, color: 'var(--tx3)',
+              fontFamily: 'JetBrains Mono' }}>
+              threshold: {passThresh}
+            </span>
+            {briefing.talent_reserve_eligible && (
+              <span style={{
+                fontFamily: 'JetBrains Mono', fontSize: 9, fontWeight: 700,
+                letterSpacing: '0.08em', padding: '3px 8px', borderRadius: 5,
+                background: 'rgba(216,184,120,.15)', color: '#d8b878',
+                border: '1px solid rgba(216,184,120,.3)',
+              }}>
+                ⭐ RESERVE
+              </span>
+            )}
+          </div>
+          {briefing.verdict_reasoning && (
+            <div style={{ fontSize: 12, color: 'var(--tx2)', lineHeight: 1.5 }}>
+              {briefing.verdict_reasoning}
+            </div>
+          )}
+        </div>
+      </div>
+
+      {/* ── 5-Dimension Scores ── */}
+      {Object.keys(dimensions).length > 0 && (
+        <div style={{ marginBottom: 14 }}>
+          <div style={{ fontSize: 10, fontWeight: 700, color: 'var(--tx3)',
+            letterSpacing: '0.1em', textTransform: 'uppercase',
+            fontFamily: 'JetBrains Mono', marginBottom: 8 }}>
+            Dimension Scores
+          </div>
+          <div style={{ background: 'var(--pan2)', border: '1px solid var(--ln)',
+            borderRadius: 10, padding: 12 }}>
+            {DIMENSIONS_META.map(d => {
+              const score  = dimensions[d.key];
+              const weight = weights[d.key];
+              if (score === undefined) return null;
+              const barColor = score >= 80 ? '#4ade80'
+                            : score >= 65 ? '#5b8def'
+                            : score >= 50 ? '#d8b878' : '#e0758a';
+              return (
+                <div key={d.key} style={{ marginBottom: 8 }}>
+                  <div style={{ display: 'flex', justifyContent: 'space-between',
+                    alignItems: 'center', marginBottom: 4 }}>
+                    <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+                      <span style={{ color: barColor, fontSize: 13 }}>{d.icon}</span>
+                      <span style={{ fontSize: 12, color: 'var(--tx)', fontWeight: 500 }}>
+                        {d.label}
+                      </span>
+                      {weight !== undefined && (
+                        <span style={{ fontSize: 9, color: 'var(--tx3)',
+                          fontFamily: 'JetBrains Mono' }}>
+                          ×{Math.round(weight * 100)}%
+                        </span>
+                      )}
+                    </div>
+                    <span style={{ fontSize: 12, color: barColor, fontWeight: 700,
+                      fontFamily: 'JetBrains Mono' }}>
+                      {score}
+                    </span>
+                  </div>
+                  <div style={{ height: 4, background: 'var(--pan)',
+                    borderRadius: 2, overflow: 'hidden' }}>
+                    <div style={{ width: `${score}%`, height: '100%',
+                      background: barColor, transition: 'width .4s' }} />
+                  </div>
+                </div>
+              );
+            })}
+          </div>
+        </div>
+      )}
+
+      {/* ── Anti-cheat status ── */}
+      <div style={{
+        background: sStyle.bg, border: `1px solid ${sStyle.color}40`,
+        borderRadius: 10, padding: '10px 14px', marginBottom: 14,
+        display: 'flex', alignItems: 'center', justifyContent: 'space-between',
+      }}>
+        <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
+          <span style={{ fontSize: 14 }}>
+            {severity === 'none' ? '🛡' : severity === 'high' ? '⚠' : '◑'}
+          </span>
+          <div>
+            <div style={{ fontSize: 11, fontWeight: 700, color: sStyle.color,
+              fontFamily: 'JetBrains Mono', textTransform: 'uppercase',
+              letterSpacing: '0.08em' }}>
+              Integrity Check: {sStyle.label}
+            </div>
+            <div style={{ fontSize: 11, color: 'var(--tx3)', marginTop: 2 }}>
+              {flagCount === 0
+                ? 'No anti-cheat flags raised during interview'
+                : `${flagCount} flag${flagCount > 1 ? 's' : ''} raised`}
+            </div>
+          </div>
+        </div>
+        {flags.length > 0 && (
+          <div style={{ fontSize: 10, color: 'var(--tx3)',
+            fontFamily: 'JetBrains Mono' }}>
+            {flags.slice(0, 2).map(f => f.type).join(', ')}
+            {flags.length > 2 && ` +${flags.length - 2}`}
+          </div>
+        )}
+      </div>
+
+      {/* ── Summary ── */}
+      {briefing.summary && (
+        <div style={{ background: 'rgba(91,141,239,.06)',
+          border: '1px solid rgba(91,141,239,.18)',
+          borderRadius: 12, padding: 14, marginBottom: 14, fontSize: 13,
+          color: 'var(--tx2)', lineHeight: 1.7 }}>
+          {briefing.summary}
+        </div>
+      )}
+
+      {/* ── Red flags (high severity) ── */}
+      {redFlags.length > 0 && (
+        <div style={{ background: 'rgba(224,117,138,.08)',
+          border: '1px solid rgba(224,117,138,.3)', borderRadius: 10,
+          padding: 12, marginBottom: 12 }}>
+          <div style={{ fontSize: 11, fontWeight: 700, color: '#e0758a',
+            textTransform: 'uppercase', letterSpacing: '0.1em',
+            fontFamily: 'JetBrains Mono', marginBottom: 8 }}>
+            🚩 Red Flags
+          </div>
+          {redFlags.map((rf, i) => (
+            <div key={i} style={{ fontSize: 12, color: 'var(--tx2)',
+              marginBottom: 4, display: 'flex', gap: 6 }}>
+              <span style={{ color: '#e0758a' }}>!</span>{rf}
+            </div>
+          ))}
+        </div>
+      )}
+
+      {/* ── Strengths + Concerns side-by-side ── */}
+      {(strengths.length > 0 || concerns.length > 0) && (
+        <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr',
+          gap: 12, marginBottom: 12 }}>
+          {strengths.length > 0 && (
+            <div style={{ background: 'rgba(74,222,128,.06)',
+              border: '1px solid rgba(74,222,128,.2)', borderRadius: 10, padding: 12 }}>
+              <div style={{ fontSize: 11, fontWeight: 700, color: '#4ade80',
+                textTransform: 'uppercase', letterSpacing: '0.1em',
+                fontFamily: 'JetBrains Mono', marginBottom: 8 }}>
+                Strengths
+              </div>
+              {strengths.slice(0, 4).map((s, i) => (
+                <div key={i} style={{ fontSize: 12, color: 'var(--tx2)',
+                  marginBottom: 4, display: 'flex', gap: 6 }}>
+                  <span style={{ color: '#4ade80', flexShrink: 0 }}>+</span>
+                  <span>{s}</span>
+                </div>
+              ))}
+            </div>
+          )}
+          {concerns.length > 0 && (
+            <div style={{ background: 'rgba(216,184,120,.06)',
+              border: '1px solid rgba(216,184,120,.2)', borderRadius: 10, padding: 12 }}>
+              <div style={{ fontSize: 11, fontWeight: 700, color: '#d8b878',
+                textTransform: 'uppercase', letterSpacing: '0.1em',
+                fontFamily: 'JetBrains Mono', marginBottom: 8 }}>
+                Concerns
+              </div>
+              {concerns.slice(0, 4).map((c, i) => (
+                <div key={i} style={{ fontSize: 12, color: 'var(--tx2)',
+                  marginBottom: 4, display: 'flex', gap: 6 }}>
+                  <span style={{ color: '#d8b878', flexShrink: 0 }}>–</span>
+                  <span>{c}</span>
+                </div>
+              ))}
+            </div>
+          )}
+        </div>
+      )}
+
+      {/* ── Resume Validation ── */}
+      {resumeValid.length > 0 && (
+        <div style={{ marginBottom: 14 }}>
+          <div style={{ fontSize: 10, fontWeight: 700, color: 'var(--tx3)',
+            letterSpacing: '0.1em', textTransform: 'uppercase',
+            fontFamily: 'JetBrains Mono', marginBottom: 8 }}>
+            Resume Validation
+          </div>
+          <div style={{ background: 'var(--pan2)', border: '1px solid var(--ln)',
+            borderRadius: 10, overflow: 'hidden' }}>
+            {resumeValid.slice(0, 5).map((rv, i) => {
+              const v = rv.verdict || 'unprobed';
+              const vColors = {
+                supports:    { bg: 'rgba(74,222,128,.1)',  c: '#4ade80', icon: '✓' },
+                contradicts: { bg: 'rgba(224,117,138,.1)', c: '#e0758a', icon: '✗' },
+                unprobed:    { bg: 'rgba(255,255,255,.03)', c: 'var(--tx3)', icon: '○' },
+              };
+              const vc = vColors[v] || vColors.unprobed;
+              return (
+                <div key={i} style={{
+                  padding: '10px 12px', display: 'flex', alignItems: 'flex-start', gap: 10,
+                  borderTop: i > 0 ? '1px solid var(--ln)' : 'none',
+                  background: vc.bg,
+                }}>
+                  <span style={{ color: vc.c, fontSize: 13, flexShrink: 0,
+                    fontFamily: 'JetBrains Mono', fontWeight: 700 }}>
+                    {vc.icon}
+                  </span>
+                  <div style={{ flex: 1 }}>
+                    <div style={{ fontSize: 12, color: 'var(--tx)',
+                      marginBottom: 2, fontWeight: 500 }}>
+                      {rv.claim}
+                    </div>
+                    {rv.evidence && (
+                      <div style={{ fontSize: 11, color: 'var(--tx3)',
+                        lineHeight: 1.5, fontStyle: 'italic' }}>
+                        {rv.evidence}
+                      </div>
+                    )}
+                  </div>
+                </div>
+              );
+            })}
+          </div>
+        </div>
+      )}
+
+      {/* ── Focus On (for human round) ── */}
+      {focusOn.length > 0 && (
+        <div style={{ background: 'rgba(91,141,239,.06)',
+          border: '1px solid rgba(91,141,239,.2)', borderRadius: 10,
+          padding: 12, marginBottom: 12 }}>
+          <div style={{ fontSize: 11, fontWeight: 700, color: '#5b8def',
+            textTransform: 'uppercase', letterSpacing: '0.1em',
+            fontFamily: 'JetBrains Mono', marginBottom: 8 }}>
+            🎯 Focus on (Human Round)
+          </div>
+          {focusOn.slice(0, 4).map((f, i) => (
+            <div key={i} style={{ fontSize: 12, color: 'var(--tx2)',
+              marginBottom: 4, display: 'flex', gap: 6 }}>
+              <span style={{ color: '#5b8def', flexShrink: 0 }}>→</span>
+              <span>{f}</span>
+            </div>
+          ))}
+        </div>
+      )}
+
+      {/* ── Already Tested + Suggested Questions ── */}
+      {(alreadyTested.length > 0 || suggestedQs.length > 0) && (
+        <div style={{ display: 'grid', gridTemplateColumns:
+          alreadyTested.length > 0 && suggestedQs.length > 0 ? '1fr 1fr' : '1fr',
+          gap: 12, marginBottom: 14 }}>
+          {alreadyTested.length > 0 && (
+            <div style={{ background: 'var(--pan2)', border: '1px solid var(--ln)',
+              borderRadius: 10, padding: 12 }}>
+              <div style={{ fontSize: 11, fontWeight: 700, color: 'var(--tx2)',
+                textTransform: 'uppercase', letterSpacing: '0.1em',
+                fontFamily: 'JetBrains Mono', marginBottom: 8 }}>
+                ✓ Already Tested
+              </div>
+              {alreadyTested.slice(0, 4).map((t, i) => (
+                <div key={i} style={{ fontSize: 11, color: 'var(--tx3)',
+                  marginBottom: 4 }}>
+                  · {t}
+                </div>
+              ))}
+            </div>
+          )}
+          {suggestedQs.length > 0 && (
+            <div style={{ background: 'rgba(143,155,255,.06)',
+              border: '1px solid rgba(143,155,255,.2)', borderRadius: 10, padding: 12 }}>
+              <div style={{ fontSize: 11, fontWeight: 700, color: '#8f9bff',
+                textTransform: 'uppercase', letterSpacing: '0.1em',
+                fontFamily: 'JetBrains Mono', marginBottom: 8 }}>
+                💡 Suggested Qs
+              </div>
+              {suggestedQs.slice(0, 3).map((q, i) => (
+                <div key={i} style={{ fontSize: 11, color: 'var(--tx2)',
+                  marginBottom: 6, lineHeight: 1.5 }}>
+                  → {q}
+                </div>
+              ))}
+            </div>
+          )}
+        </div>
+      )}
+
+      {/* ── Collapsible transcript ── */}
+      {transcript.length > 0 && (
+        <div style={{ border: '1px solid var(--ln)', borderRadius: 10,
+          background: 'var(--pan2)', overflow: 'hidden' }}>
+          <div onClick={() => setShowTranscript(!showTranscript)}
+            style={{ padding: '12px 14px', cursor: 'pointer', userSelect: 'none',
+              display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+            <span style={{ fontSize: 11, fontWeight: 700, color: 'var(--tx2)',
+              textTransform: 'uppercase', letterSpacing: '0.1em',
+              fontFamily: 'JetBrains Mono' }}>
+              Full Transcript ({transcript.length} turns)
+            </span>
+            <span style={{ fontFamily: 'JetBrains Mono', fontSize: 14,
+              color: 'var(--tx3)',
+              transform: showTranscript ? 'rotate(90deg)' : 'none',
+              transition: 'transform .2s' }}>
+              ▸
+            </span>
+          </div>
+          {showTranscript && (
+            <div style={{ borderTop: '1px solid var(--ln)',
+              maxHeight: 420, overflowY: 'auto' }}>
+              {transcript.map((turn, i) => {
+                const score = turn.evaluation?.dimension_score;
+                const scoreColor = score >= 75 ? '#4ade80'
+                                : score >= 50 ? '#d8b878' : '#e0758a';
+                return (
+                  <div key={i} style={{
+                    padding: '12px 14px',
+                    borderTop: i > 0 ? '1px solid var(--ln)' : 'none',
+                  }}>
+                    <div style={{ display: 'flex', justifyContent: 'space-between',
+                      marginBottom: 6, fontSize: 10, color: 'var(--tx3)',
+                      fontFamily: 'JetBrains Mono', textTransform: 'uppercase',
+                      letterSpacing: '0.06em' }}>
+                      <span>
+                        Q{i + 1}
+                        {turn.is_probe && <span style={{ marginLeft: 6,
+                          color: '#8f9bff' }}>· probe</span>}
+                        {turn.dimension && <span style={{ marginLeft: 6 }}>
+                          · {turn.dimension.replace(/_/g, ' ')}
+                        </span>}
+                      </span>
+                      {score !== undefined && (
+                        <span style={{ color: scoreColor, fontWeight: 700 }}>
+                          {score}/100
+                        </span>
+                      )}
+                    </div>
+                    <div style={{ fontSize: 12, fontWeight: 600, color: 'var(--jd)',
+                      marginBottom: 4, lineHeight: 1.5 }}>
+                      Q: {turn.q}
+                    </div>
+                    <div style={{ fontSize: 12, color: 'var(--tx2)',
+                      lineHeight: 1.6, whiteSpace: 'pre-wrap' }}>
+                      A: {turn.a}
+                    </div>
+                  </div>
+                );
+              })}
+            </div>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
+/* ── LEGACY AI summary view (pre-ARIA candidates) ────────────── */
+function LegacyAISummary({ summary, answers, strengths, concerns }) {
   return (
     <div style={{ marginBottom: 24 }}>
       <div style={{ fontSize: 12, fontWeight: 600, color: 'var(--tx)',
         letterSpacing: '0.1em', textTransform: 'uppercase',
         fontFamily: 'JetBrains Mono', marginBottom: 12 }}>
         AI Interview Report
+        <span style={{ marginLeft: 8, fontSize: 9,
+          color: 'var(--tx3)', letterSpacing: '0.05em' }}>
+          (legacy format)
+        </span>
       </div>
 
-      {/* summary text */}
       {summary && (
-        <div style={{ background: 'rgba(91,141,239,.06)', border: '1px solid rgba(91,141,239,.18)',
+        <div style={{ background: 'rgba(91,141,239,.06)',
+          border: '1px solid rgba(91,141,239,.18)',
           borderRadius: 12, padding: 14, marginBottom: 12, fontSize: 13,
           color: 'var(--tx2)', lineHeight: 1.7 }}>
           {summary}
         </div>
       )}
 
-      {/* strengths / concerns */}
       {(strengths.length > 0 || concerns.length > 0) && (
-        <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 12, marginBottom: 12 }}>
+        <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr',
+          gap: 12, marginBottom: 12 }}>
           {strengths.length > 0 && (
             <div style={{ background: 'rgba(74,222,128,.06)',
               border: '1px solid rgba(74,222,128,.2)', borderRadius: 10, padding: 12 }}>
@@ -237,7 +714,6 @@ function AIInterviewSummary({ candidate }) {
         </div>
       )}
 
-      {/* Q&A highlights */}
       {answers.slice(0, 3).map((qa, i) => (
         <div key={i} style={{ marginBottom: 10, padding: 12,
           background: 'var(--pan2)', borderRadius: 10,

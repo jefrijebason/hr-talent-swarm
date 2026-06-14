@@ -76,17 +76,46 @@ def run_ai_pipeline(candidate_id, pdf_bytes, job_role, jd_text=DEFAULT_JD):
         return {"status": "rejected", "reason": "low_resume_score",
                 "resume_score": resume_score}
 
-    # ── STAGE 2: Send AI Interview Link ──────────────────────────
-    print(f"[ORCH] Stage 2: Sending AI Interview Link")
+    # Save resume text first (we'll need it for either branch)
+    update_candidate(candidate_id, {
+        "resume_text": _get_resume_text(pdf_bytes),
+        "jd_text_used": jd_text,
+    })
 
+    # ── STAGE 2: Vibe Engineering OR AI Interview ────────────────  ← MODIFIED
+    candidate = get_candidate(candidate_id)
+    job_id    = candidate.get("job_id", "")
+    job       = get_job(job_id) if job_id else None
+
+    # NEW: If job has the Vibe Engineering Challenge enabled, send that first
+    # Accept BOTH new field (coding_assessment_enabled) AND legacy (coding_round_enabled)
+    vibe_enabled = job and (
+        job.get("coding_assessment_enabled") or
+        job.get("coding_round_enabled")
+    )
+    if vibe_enabled:
+        print(f"[ORCH] Stage 2: Sending Vibe Engineering Challenge")
+        log_agent("ORCHESTRATOR", "vibe_required", "Job requires Vibe Engineering Challenge", candidate_id)
+        _send_vibe_engineering_link(candidate_id)
+        update_candidate(candidate_id, {"status": "vibe_engineering_sent"})
+        write_audit(candidate_id, "ORCHESTRATOR",
+                    "vibe_sent", {"resume_score": resume_score, "job_id": job_id})
+
+        print(f"[ORCH] Pipeline paused — waiting for Vibe Engineering completion")
+        log_agent("ORCHESTRATOR", "pipeline_paused", "Waiting for Vibe Engineering completion", candidate_id)
+        print(f"[ORCH] ═══ AI PIPELINE PAUSED (VIBE) ═══\n")
+        return {
+            "status": "vibe_engineering_sent",
+            "resume_score": resume_score,
+            "message": "Waiting for Vibe Engineering Challenge",
+        }
+
+    # EXISTING: Send AI Interview link directly
+    print(f"[ORCH] Stage 2: Sending AI Interview Link")
     _send_interview_link(candidate_id)
     log_agent("ORCHESTRATOR", "ai_interview_sent", "Interview link emailed to candidate", candidate_id)
 
-    update_candidate(candidate_id, {
-        "status":      "ai_interview_sent",
-        "resume_text": _get_resume_text(pdf_bytes),
-        "jd_text_used": jd_text
-    })
+    update_candidate(candidate_id, {"status": "ai_interview_sent"})
 
     write_audit(candidate_id, "ORCHESTRATOR",
                 "ai_interview_sent", {"resume_score": resume_score})
@@ -99,6 +128,45 @@ def run_ai_pipeline(candidate_id, pdf_bytes, job_role, jd_text=DEFAULT_JD):
         "resume_score": resume_score,
         "message":      "Waiting for candidate to complete AI interview"
     }
+
+
+# ════════════════════════════════════════════════════════════════════
+# NEW: Resume pipeline after Vibe Engineering Challenge is completed
+# ════════════════════════════════════════════════════════════════════
+def resume_pipeline_after_vibe(candidate_id: str):
+    """
+    Called by vibe_engineering agent after the candidate PASSES the challenge.
+    Sends the AI Interview link next.
+    """
+    print(f"\n[ORCH] ═══ VIBE PASSED — SENDING AI INTERVIEW: {candidate_id} ═══")
+    log_agent("ORCHESTRATOR", "vibe_complete", "Vibe Engineering passed — sending AI interview", candidate_id)
+    try:
+        candidate = get_candidate(candidate_id)
+        if not candidate:
+            print(f"[ORCH] Candidate not found: {candidate_id}")
+            return {"status": "missing_candidate"}
+
+        _send_interview_link(candidate_id)
+        update_candidate(candidate_id, {"status": "ai_interview_sent"})
+
+        write_audit(candidate_id, "ORCHESTRATOR",
+                    "ai_interview_sent_after_vibe", {
+                        "vibe_score": candidate.get("vibe_engineering_score"),
+                    })
+
+        _notify_hr_of_progress(candidate_id, "vibe_passed",
+            f"Candidate passed Vibe Engineering Challenge "
+            f"(score: {candidate.get('vibe_engineering_score','N/A')}/100). "
+            f"AI Interview link sent.")
+
+        log_agent("ORCHESTRATOR", "ai_interview_sent",
+                  f"AI interview sent after Vibe. Vibe score: {candidate.get('vibe_engineering_score')}/100", candidate_id)
+        print(f"[ORCH] ═══ AI INTERVIEW LINK SENT ═══\n")
+        return {"status": "ai_interview_sent"}
+    except Exception as e:
+        print(f"[ORCH] resume_pipeline_after_vibe error: {e}")
+        log_agent("ORCHESTRATOR", "error", f"Vibe resume error: {str(e)[:50]}", candidate_id)
+        return {"status": "error", "error": str(e)}
 
 
 def resume_pipeline_after_interview(candidate_id, ai_score):
@@ -156,35 +224,19 @@ def resume_pipeline_after_interview(candidate_id, ai_score):
         "combined":     combined_ai
     })
 
-    # Check if coding round is enabled
-    job = None
-    if job_id:
-        job = get_job(job_id)
+    # Check if LEGACY coding round is enabled — DISABLED for Option B
+    # (New flow uses Vibe Engineering BEFORE AI interview instead)
+    # The old code is left commented out below for reference.
+    #
+    # job = None
+    # if job_id:
+    #     job = get_job(job_id)
+    #
+    # if job and job.get("coding_round_enabled") and not job.get("coding_assessment_enabled"):
+    #     print(f"[ORCH] Legacy coding round enabled — sending assessment")
+    #     ...
 
-    if job and job.get("coding_round_enabled"):
-        print(f"[ORCH] Coding round enabled — sending assessment")
-        log_agent("ORCHESTRATOR", "coding_required", "Job requires coding assessment", candidate_id)
-
-        _send_coding_assessment_link(candidate_id, job_id)
-        log_agent("ORCHESTRATOR", "coding_sent", "Coding assessment link emailed", candidate_id)
-
-        update_candidate(candidate_id, {"status": "coding_sent"})
-
-        write_audit(candidate_id, "ORCHESTRATOR",
-                    "coding_sent", {"job_id": job_id, "combined_ai_score": combined_ai})
-
-        _notify_hr_of_progress(candidate_id, "coding_assessment_sent",
-            f"Candidate passed AI interview. Coding assessment sent. Score: {ai_score}/100.")
-
-        log_agent("ORCHESTRATOR", "pipeline_paused", "Waiting for coding assessment", candidate_id)
-        print(f"[ORCH] ═══ PIPELINE PAUSED — CODING SENT ═══\n")
-        return {
-            "status":        "coding_sent",
-            "combined":      combined_ai,
-            "coding_needed": True
-        }
-
-    # No coding → go straight to technical interview
+    # All candidates go straight to technical interview (Vibe candidates already passed coding)
     log_agent("ORCHESTRATOR", "assigning_interviewer", "Matching best interviewer", candidate_id)
 
     assign_result = _assign_interviewer(
@@ -527,6 +579,75 @@ Complete within 3 days to stay in the pipeline.
         log_agent("COMMUNICATOR", "email_sent", f"AI Interview link → {candidate['email']}", candidate_id)
     except Exception as e:
         print(f"[ORCH] Interview link error: {e}")
+
+
+# ════════════════════════════════════════════════════════════════════
+# NEW: Send Vibe Engineering Challenge link
+# ════════════════════════════════════════════════════════════════════
+def _send_vibe_engineering_link(candidate_id):
+    """Send the candidate a link to start the Vibe Engineering Challenge."""
+    try:
+        import urllib.parse
+        candidate = get_candidate(candidate_id)
+        if not candidate or not candidate.get("email"):
+            print(f"[ORCH] No email for candidate {candidate_id}")
+            return
+
+        name = urllib.parse.quote(candidate.get("name", "Candidate"))
+        role = urllib.parse.quote(candidate.get("applied_role", ""))
+
+        vibe_url = (
+            f"http://localhost:3001"
+            f"?vibe={candidate_id}"
+            f"&name={name}&role={role}"
+        )
+
+        send_email(
+            to_address=candidate["email"],
+            subject=f"🛠️ Coding Challenge — {candidate.get('applied_role', '')}",
+            body_html=f"""
+<div style="font-family:Arial,sans-serif;max-width:600px;margin:0 auto;padding:24px">
+<h2 style="color:#0f172a">Your Vibe Engineering Challenge is Ready</h2>
+<p>Hi {candidate['name']},</p>
+<p>Congratulations on passing the initial screening! The next step is a
+<strong>Vibe Engineering Challenge</strong> — a hands-on coding task where you
+can (and should) use the built-in AI assistant.</p>
+
+<p>This isn't a LeetCode test. We want to see how you work WITH AI tools.</p>
+
+<table style="border-collapse:collapse;width:100%;margin:16px 0;font-size:14px">
+<tr style="background:#f8fafc"><td style="padding:10px;font-weight:700;width:140px">⏱ Duration</td><td style="padding:10px">30 minutes</td></tr>
+<tr><td style="padding:10px;font-weight:700">🤖 AI Assistant</td><td style="padding:10px">Built-in — strategic usage encouraged</td></tr>
+<tr style="background:#f8fafc"><td style="padding:10px;font-weight:700">💻 Language</td><td style="padding:10px">Python (runs in your browser)</td></tr>
+<tr><td style="padding:10px;font-weight:700">📝 Format</td><td style="padding:10px">Fix a bug + add a small feature</td></tr>
+<tr style="background:#f8fafc"><td style="padding:10px;font-weight:700;color:#d97706">Deadline</td><td style="padding:10px;color:#d97706;font-weight:700">Complete within 3 days</td></tr>
+</table>
+
+<p><strong>What's evaluated:</strong></p>
+<ul>
+<li>Did you fix the bug correctly?</li>
+<li>Did the feature work?</li>
+<li>Was your code clean?</li>
+<li><strong>How well did you use the AI assistant?</strong></li>
+<li>Did you verify AI suggestions before using them?</li>
+</ul>
+
+<a href="{vibe_url}"
+   style="display:inline-block;background:linear-gradient(135deg,#5b8def,#3f6fd1);
+   color:#fff;padding:14px 32px;text-decoration:none;border-radius:12px;
+   font-weight:bold;font-size:16px;margin:16px 0">
+   Start Challenge →
+</a>
+
+<p style="color:#a8a29e;font-size:12px;margin-top:20px">
+This link is unique to you. Do not share it.
+Your interactions with the AI assistant are part of the evaluation.
+</p>
+</div>""")
+        print(f"[ORCH] Vibe Engineering link sent to {candidate['email']}")
+        log_agent("COMMUNICATOR", "email_sent", f"Vibe Engineering link → {candidate['email']}", candidate_id)
+    except Exception as e:
+        print(f"[ORCH] Vibe link error: {e}")
 
 
 def _send_coding_assessment_link(candidate_id, job_id=None):

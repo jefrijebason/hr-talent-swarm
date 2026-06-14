@@ -3,11 +3,13 @@ from fastapi.middleware.cors import CORSMiddleware
 from datetime import datetime, timedelta
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
-from typing import Optional
+from typing import Optional, List, Dict, Any
 import threading
 import uvicorn
 import uuid
 import io
+# ── 5. SCHEDULING PAGE — POST (save + notify) ────────────────────────────
+from fastapi import Form
 
 from contextlib import asynccontextmanager
 from fastapi import FastAPI, HTTPException, Request, Body
@@ -20,8 +22,11 @@ from shared.cosmos_client import (
     get_all_candidates, update_candidate,
     get_pipeline_stats, get_talent_pool,
     get_bias_report, audit, write_audit,
-    get_job
 )
+# Aliased to avoid shadowing by the /api/jobs/{job_id} route handler defined later
+from shared.cosmos_client import get_job as cosmos_get_job
+get_job = cosmos_get_job  # legacy alias — existing code can keep calling get_job()
+
 from shared.service_bus import publish_human_gate
 from agents.orchestrator.agent import (
     create_candidate, run_ai_pipeline,
@@ -38,6 +43,35 @@ from agents.interviewer.anti_malpractice import (
     evaluate_interrogation_answers
 )
 from shared.config import config
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  ARIA AI Interviewer imports
+# ═══════════════════════════════════════════════════════════════════════════
+from agents.aria_interviewer.agent import (
+    start_interview         as aria_start,
+    submit_answer           as aria_submit_answer,
+    complete_interview      as aria_complete,
+    resume_interview        as aria_resume,
+    get_interview_state     as aria_get_state,
+    record_anti_cheat_flag  as aria_record_flag,
+)
+from agents.aria_interviewer.vision_analyzer  import analyze_screen_frame
+from agents.aria_interviewer.face_tracker     import (
+    aggregate_events       as face_aggregate,
+    event_to_immediate_flag as face_immediate_flag,
+)
+from agents.aria_interviewer.voice_fingerprint import analyze_audio_chunk
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  Vibe Engineering Challenge imports
+# ═══════════════════════════════════════════════════════════════════════════
+from agents.vibe_engineering import (
+    start_challenge       as vibe_start,
+    ask_ai_assistant      as vibe_ai_help,
+    submit_challenge      as vibe_submit,
+    get_challenge_state   as vibe_get_state,
+    save_code_snapshot    as vibe_snapshot,
+)
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -525,13 +559,21 @@ class JobPostRequest(BaseModel):
     department:       str = ""
     jd_text:          str
     interview_mode:   str = "standard"
-    coding_enabled:   bool = True
+    coding_enabled:   bool = True            # legacy coding-round flag
     ai_interview_enabled: bool = True
     salary_min:       str = ""
     salary_max:       str = ""
     location:         str = "Bangalore"
     human_rounds:     list = []
     status: str = "active"
+
+    # ── NEW: ARIA Interview configuration ──
+    coding_assessment_enabled: bool = False  # Vibe Engineering Challenge toggle
+    pass_threshold:            int = 70
+    dimension_weights:         Optional[Dict[str, float]] = None
+    knowledge_base:            str = ""
+    interview_direction:       str = ""
+    attached_documents_text:   str = ""
 
 @app.post("/api/jobs")
 async def post_job(request: JobPostRequest):
@@ -577,7 +619,15 @@ async def post_job(request: JobPostRequest):
             "jd_quality_score":       quality.get("overall_quality"),
             "jd_issues":              quality.get("issues", []),
             "improved_jd":            quality.get("improved_jd"),
-            "created_at":             datetime.utcnow().isoformat()
+            "created_at":             datetime.utcnow().isoformat(),
+
+            # ── NEW: ARIA Interview configuration ──
+            "coding_assessment_enabled": request.coding_assessment_enabled,
+            "pass_threshold":            request.pass_threshold,
+            "dimension_weights":         request.dimension_weights,
+            "knowledge_base":            request.knowledge_base,
+            "interview_direction":       request.interview_direction,
+            "attached_documents_text":   request.attached_documents_text,
         }
 
         from shared.cosmos_client import save_job
@@ -1037,18 +1087,19 @@ def schedule_form(aid: str):
             "Error", "✕", "#e0758a", "Something went wrong",
             f"<p>{str(e)}</p>"
         ), status_code=500)
-
-
-# ── 5. SCHEDULING PAGE — POST (save + notify) ────────────────────────────
+# ── 5. SCHEDULING PAGE — POST (save + create Teams meeting + notify) ────
 from fastapi import Form
 
 @app.post("/api/assignments/{aid}/schedule", response_class=HTMLResponse)
 def schedule_submit(aid: str,
                      scheduled_at: str = Form(...),
                      note: str = Form("")):
-    """Save chosen slot and email candidate."""
+    """Save chosen slot, create Teams meeting, and email candidate."""
     try:
-        from shared.cosmos_client import get_assignment, update_assignment, get_candidate
+        from shared.cosmos_client import (
+            get_assignment, update_assignment,
+            get_candidate, update_candidate, get_interviewer,
+        )
         a = get_assignment(aid)
         if not a:
             return HTMLResponse(_response_page(
@@ -1056,7 +1107,7 @@ def schedule_submit(aid: str,
                 "<p>This link is no longer valid.</p>"
             ), status_code=404)
 
-        # Save chosen time
+        # Save chosen time first
         update_assignment(aid, {
             "scheduled_at": scheduled_at,
             "scheduler_note": note,
@@ -1064,38 +1115,95 @@ def schedule_submit(aid: str,
             "scheduled_confirmed_at": datetime.utcnow().isoformat()
         })
 
-# ── Send candidate email with the chosen time + meeting link ──
+        # ─────────────────────────────────────────────────────────────
+        # Resolve candidate + interviewer + role NOW (we need them
+        # BEFORE creating the Teams meeting)
+        # ─────────────────────────────────────────────────────────────
+        candidate = get_candidate(a["candidate_id"]) if a.get("candidate_id") else None
+
+        iv = None
+        iv_id = a.get("assigned_to", "")
+        if iv_id.startswith("custom_"):
+            iv_name = a.get("custom_assignee_name", "your interviewer")
+            iv_email = a.get("custom_assignee_email", "")
+        else:
+            iv = get_interviewer(iv_id) if iv_id else None
+            iv_name = (iv or {}).get("name", "your interviewer")
+            iv_email = (iv or {}).get("email", "")
+
+        role = (candidate or {}).get("applied_role") or a.get("role_name") or "the role"
+
+        # ─────────────────────────────────────────────────────────────
+        # CREATE THE TEAMS MEETING (this was missing!)
+        # ─────────────────────────────────────────────────────────────
+        meeting_url = a.get("meeting_url", "")
+        if not meeting_url:
+            try:
+                slot_dt = datetime.fromisoformat(scheduled_at)
+                from agents.scheduler.agent import get_access_token, create_teams_meeting
+                token = get_access_token()
+                if token:
+                    attendees = []
+                    if candidate and candidate.get("email"):
+                        attendees.append(candidate["email"])
+                    if iv_email:
+                        attendees.append(iv_email)
+
+                    title = f"Interview — {(candidate or {}).get('name','Candidate')} | {role}"
+                    result = create_teams_meeting(
+                        token, slot_dt, attendees, title,
+                        (candidate or {}).get("name", "")
+                    )
+                    if result.get("success"):
+                        meeting_url = result.get("meeting_url", "")
+                        print(f"[SCHEDULE] ✓ Teams meeting created: {meeting_url[:60]}...")
+                    else:
+                        print(f"[SCHEDULE] Teams creation failed: {result.get('error','')[:120]}")
+            except Exception as e:
+                print(f"[SCHEDULE] Teams creation error: {e}")
+
+            # Fallback static Teams URL if Graph creation failed
+            if not meeting_url:
+                meeting_url = "https://teams.live.com/meet/9367792243138?p=sZHbbDKnF227zfxcDK"
+                print("[SCHEDULE] Using fallback Teams URL")
+
+            # Persist to assignment + candidate so it shows up everywhere
+            try:
+                update_assignment(aid, {"meeting_url": meeting_url})
+                if candidate:
+                    update_candidate(a["candidate_id"], {
+                        "technical_interview_meeting_url": meeting_url,
+                        "hr_interview_meeting_url":        meeting_url,
+                        "teams_meeting_url":               meeting_url,
+                    })
+            except Exception as e:
+                print(f"[SCHEDULE] Could not persist meeting_url: {e}")
+
+        # ─────────────────────────────────────────────────────────────
+        # Send candidate email with the chosen time + meeting link
+        # ─────────────────────────────────────────────────────────────
         try:
             from agents.communicator.agent import send_email
-            from shared.cosmos_client import get_interviewer
-
-            candidate = get_candidate(a["candidate_id"]) if a.get("candidate_id") else None
             if not candidate or not candidate.get("email"):
                 print(f"[SCHEDULE] No candidate email for assignment {aid}")
             else:
-                # Resolve interviewer name (handle both pool + custom assignees)
-                iv_id = a.get("assigned_to", "")
-                if iv_id.startswith("custom_"):
-                    iv_name = a.get("custom_assignee_name", "your interviewer")
-                else:
-                    iv = get_interviewer(iv_id) if iv_id else None
-                    iv_name = (iv or {}).get("name", "your interviewer")
-
                 dt_human = datetime.fromisoformat(scheduled_at).strftime(
                     "%A, %B %d, %Y at %I:%M %p"
                 )
 
-                # Use existing meeting URL if scheduler already created one,
-                # otherwise fall back to a clear "calendar invite to follow" line
-                meeting_url = a.get("meeting_url", "")
-                meeting_section = (
-                    f"""<p><a href="{meeting_url}"
-                       style="display:inline-block;background:#6366f1;color:#fff;
-                       padding:12px 24px;text-decoration:none;border-radius:8px;
-                       font-weight:bold">Join Teams Meeting →</a></p>"""
-                    if meeting_url else
-                    """<p>A Teams calendar invite with the meeting link will arrive shortly.</p>"""
-                )
+                # ALWAYS show a join button now (we have a URL — either real or fallback)
+                meeting_section = f"""
+<div style="margin:20px 0;text-align:center">
+  <a href="{meeting_url}"
+     style="display:inline-block;background:linear-gradient(135deg,#5b8def,#3f6fd1);
+     color:#fff;padding:14px 32px;text-decoration:none;border-radius:11px;
+     font-weight:bold;font-size:15px;box-shadow:0 4px 14px rgba(91,141,239,0.35)">
+    📹 Join Teams Meeting →
+  </a>
+  <p style="margin:10px 0 0;font-size:11px;color:#94a3b8">
+    Click 5 minutes before the scheduled time.
+  </p>
+</div>"""
 
                 note_section = (
                     f"""<div style="margin-top:18px;padding:14px;background:#f0f9ff;
@@ -1105,8 +1213,6 @@ def schedule_submit(aid: str,
                     </div>"""
                     if note.strip() else ""
                 )
-
-                role = candidate.get("applied_role") or a.get("role_name") or "the role"
 
                 send_email(
                     to_address=candidate["email"],
@@ -1154,6 +1260,87 @@ def schedule_submit(aid: str,
         except Exception as email_err:
             print(f"[SCHEDULE] Candidate email error: {email_err}")
 
+        # ─────────────────────────────────────────────────────────────
+        # Also email the interviewer (so they have the link too)
+        # ─────────────────────────────────────────────────────────────
+        if iv_email:
+            try:
+                from agents.communicator.agent import send_email
+                # Generate the evaluation submission URL
+                score_url = ""
+                try:
+                    from shared.tokens import generate_token
+                    score_token = generate_token('score', aid)
+                    score_url = f"http://localhost:8000/interview/score/{aid}?token={score_token}"
+                except Exception:
+                    score_url = f"http://localhost:8000/interview/score/{aid}"
+
+                send_email(
+                    to_address=iv_email,
+                    subject=f"📌 Confirmed: {(candidate or {}).get('name','Candidate')} — {role}",
+                    body_html=f"""
+<h2 style="color:#0f172a">Interview Confirmed</h2>
+<p>Hi {iv_name},</p>
+<p>Your interview with <strong>{(candidate or {}).get('name','the candidate')}</strong>
+for <strong>{role}</strong> is scheduled.</p>
+
+<table style="border-collapse:collapse;width:100%;max-width:500px;font-size:14px">
+  <tr style="background:#f8fafc">
+    <td style="padding:12px;font-weight:700;width:130px">📅 When</td>
+    <td style="padding:12px">{datetime.fromisoformat(scheduled_at).strftime('%A, %B %d, %Y at %I:%M %p')}</td>
+  </tr>
+  <tr>
+    <td style="padding:12px;font-weight:700">👤 Candidate</td>
+    <td style="padding:12px">{(candidate or {}).get('name','Candidate')}</td>
+  </tr>
+  <tr style="background:#f8fafc">
+    <td style="padding:12px;font-weight:700">🎯 AI Score</td>
+    <td style="padding:12px;font-weight:700">{(candidate or {}).get('ai_interview_score','N/A')}/100</td>
+  </tr>
+</table>
+
+<div style="margin:20px 0;text-align:center">
+  <a href="{meeting_url}"
+     style="display:inline-block;background:linear-gradient(135deg,#5b8def,#3f6fd1);color:#fff;
+     padding:14px 32px;text-decoration:none;border-radius:11px;font-weight:bold">
+    📹 Join Teams Meeting →
+  </a>
+</div>
+
+<p style="font-size:13px;color:#64748b">
+  The candidate's resume and ARIA AI briefing were sent in your earlier
+  assignment email — please review them before the meeting.
+</p>
+
+<!-- EVALUATION SUBMISSION LINK -->
+<div style="margin:24px 0;padding:22px;background:#fff;border-radius:14px;
+border:1px solid #e2e8f0">
+  <div style="font-size:11px;color:#5b8def;font-weight:700;
+              text-transform:uppercase;letter-spacing:0.08em;margin-bottom:10px">
+    📋 After the Interview
+  </div>
+  <p style="font-weight:700;color:#0f172a;margin:0 0 6px;font-size:15px">
+    Submit Your Evaluation
+  </p>
+  <p style="color:#64748b;font-size:13px;margin:0 0 14px">
+    Once the interview is complete, score the candidate and leave your notes here.
+  </p>
+  <a href="{score_url}"
+     style="display:inline-block;background:#0f172a;color:#fff;
+     padding:13px 28px;text-decoration:none;border-radius:11px;
+     font-weight:700;font-size:14px">
+    Submit Your Evaluation →
+  </a>
+  <p style="color:#94a3b8;font-size:11px;margin:10px 0 0">
+    Save this email — you'll need this link after the meeting.
+  </p>
+</div>
+"""
+                )
+                print(f"[SCHEDULE] Interviewer notified: {iv_email}")
+            except Exception as e:
+                print(f"[SCHEDULE] Interviewer email error: {e}")
+
         dt = datetime.fromisoformat(scheduled_at).strftime("%A, %B %d, %Y at %I:%M %p")
         return HTMLResponse(_response_page(
             "Scheduled",
@@ -1166,15 +1353,14 @@ def schedule_submit(aid: str,
                   border:1px solid rgba(74,222,128,.25)">
                   📅 {dt}
                 </p>
-                <p>The candidate has been notified by email with the Teams meeting link.
-                Their resume and AI interview report will be available before the meeting.</p>"""
+                <p>Both you and the candidate have been emailed the Teams meeting link.</p>"""
         ))
     except Exception as e:
+        import traceback; traceback.print_exc()
         return HTMLResponse(_response_page(
             "Error", "✕", "#e0758a", "Something went wrong",
             f"<p>{str(e)}</p>"
         ), status_code=500)
-
 
 # ── 6. TALENT RESERVE — Send invite/offer/note email ─────────────────────
 class TalentReserveEmail(BaseModel):
@@ -1731,6 +1917,7 @@ class ScoreSubmission(BaseModel):
     strengths: str = ""
     concerns: str = ""
     recommendation: str = "maybe"
+    suggested_salary: Optional[str] = None
     
 
 
@@ -2264,6 +2451,405 @@ def _send_talent_pool_email(candidate: dict, notes: str = ""):
   <p>Best regards,<br>HR Team</p>
 </div>
 """)
+
+
+# ═════════════════════════════════════════════════════════════════════════
+#  ARIA INTERVIEW ENDPOINTS — adaptive AI interview with 5-dimension scoring
+# ═════════════════════════════════════════════════════════════════════════
+
+# Request models for ARIA
+class InterviewStartRequest(BaseModel):
+    candidate_id: str
+    job_id: str
+
+
+class InterviewAnswerRequest(BaseModel):
+    candidate_id: str
+    answer_text: str
+
+
+class FaceFlagRequest(BaseModel):
+    candidate_id: str
+    events: List[Dict[str, Any]]
+    session_duration_sec: float = 0
+
+
+class ImmediateFaceFlagRequest(BaseModel):
+    candidate_id: str
+    event: Dict[str, Any]
+
+
+# ── 1. START INTERVIEW ───────────────────────────────────────────────────
+@app.post("/api/interview/start")
+def interview_start(req: InterviewStartRequest):
+    """Initialize a new AI interview session (or resume existing active one)."""
+    try:
+        result = aria_start(req.candidate_id, req.job_id)
+        return {"success": True, **result}
+    except ValueError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    except Exception as e:
+        import traceback; traceback.print_exc()
+        raise HTTPException(status_code=500, detail=f"interview start failed: {e}")
+
+
+# ── 2. SUBMIT ANSWER (drives the conversation forward) ───────────────────
+@app.post("/api/interview/answer")
+def interview_answer(req: InterviewAnswerRequest):
+    """Submit candidate's answer. Returns ARIA's next utterance + action."""
+    try:
+        result = aria_submit_answer(req.candidate_id, req.answer_text)
+        return {"success": True, **result}
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        import traceback; traceback.print_exc()
+        raise HTTPException(status_code=500, detail=f"submit_answer failed: {e}")
+
+
+# ── 3. COMPLETE INTERVIEW (generates briefing + final scoring) ───────────
+@app.post("/api/interview/{candidate_id}/complete")
+def interview_complete(candidate_id: str):
+    """End interview, generate briefing, store on candidate. Returns briefing."""
+    try:
+        briefing = aria_complete(candidate_id)
+
+        # If candidate passed, kick off interviewer assignment
+        if briefing.get("passed"):
+            try:
+                from agents.interviewer_pool.agent import assign_interviewer_to_candidate
+                candidate = get_candidate(candidate_id)
+                session = (candidate or {}).get("interview_session") or {}
+                job_id = session.get("job_id") or (candidate or {}).get("job_id")
+                if job_id:
+                    assign_interviewer_to_candidate(candidate_id, job_id)
+            except Exception as assign_err:
+                import traceback; traceback.print_exc()
+                print(f"[ARIA] Interviewer assignment trigger failed: {assign_err}")
+
+        return {"success": True, "briefing": briefing}
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        import traceback; traceback.print_exc()
+        raise HTTPException(status_code=500, detail=f"complete failed: {e}")
+
+
+# ── 4. RESUME (after browser crash / network drop) ───────────────────────
+@app.get("/api/interview/{candidate_id}/resume")
+def interview_resume(candidate_id: str):
+    """Return enough state to let the frontend continue from the last question."""
+    try:
+        return {"success": True, **aria_resume(candidate_id)}
+    except ValueError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"resume failed: {e}")
+
+
+# ── 5. STATE (lightweight check) ─────────────────────────────────────────
+@app.get("/api/interview/{candidate_id}/state")
+def interview_state(candidate_id: str):
+    try:
+        return {"success": True, **aria_get_state(candidate_id)}
+    except ValueError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+
+
+# ── 6. SCREEN-SHARE FRAME ANALYSIS ───────────────────────────────────────
+@app.post("/api/interview/{candidate_id}/screen-frame")
+async def interview_screen_frame(candidate_id: str, frame: UploadFile = File(...)):
+    """Vision-analyze a screen-share frame. Records anti-cheat flags."""
+    try:
+        # Use the aliased cosmos function to avoid the get_job route shadow
+        candidate = get_candidate(candidate_id)
+        if not candidate:
+            raise HTTPException(status_code=404, detail="candidate not found")
+        session = candidate.get("interview_session") or {}
+        job_id  = session.get("job_id") or candidate.get("job_id")
+        job     = cosmos_get_job(job_id) if job_id else {}
+
+        vision_state = session.get("vision_state", {})
+        last_hash    = vision_state.get("last_hash")
+        calls_so_far = vision_state.get("calls", 0)
+
+        frame_bytes = await frame.read()
+        ai_profile  = candidate.get("ai_profile", {}) or {}
+        top_claim   = next(
+            (c.get("text", "") for c in ai_profile.get("claims", [])
+             if any(kw in c.get("text", "").lower() for kw in
+                    ["built","designed","shipped","deployed","dashboard","app","platform"])),
+            "the project they are demoing",
+        )
+
+        result = analyze_screen_frame(
+            image_bytes=frame_bytes,
+            candidate_name=candidate.get("name", ""),
+            role=(job or {}).get("title", ""),
+            project_claim=top_claim,
+            last_hash=last_hash,
+            calls_so_far=calls_so_far,
+        )
+
+        vision_state["last_hash"] = result.get("phash") or last_hash
+        if not result.get("skipped"):
+            vision_state["calls"]  = calls_so_far + 1
+        session["vision_state"]    = vision_state
+
+        for flag in result.get("anti_cheat_flags", []):
+            flag.setdefault("source", "vision_analyzer")
+            flag.setdefault("timestamp", datetime.utcnow().isoformat())
+            session.setdefault("anti_cheat_flags", []).append(flag)
+
+        update_candidate(candidate_id, {"interview_session": session})
+        return {"success": True, **result}
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        import traceback; traceback.print_exc()
+        raise HTTPException(status_code=500, detail=f"screen-frame failed: {e}")
+
+
+# ── 7. FACE FLAG BATCH (aggregated every ~30s from frontend) ─────────────
+@app.post("/api/interview/face-flag-batch")
+def interview_face_flag_batch(req: FaceFlagRequest):
+    """Aggregate face/gaze events into anti-cheat flags."""
+    try:
+        flags = face_aggregate(req.events, req.session_duration_sec)
+        for f in flags:
+            aria_record_flag(req.candidate_id, f)
+        return {"success": True, "flags_added": len(flags)}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# ── 8. FACE FLAG IMMEDIATE (high-severity events) ────────────────────────
+@app.post("/api/interview/face-flag-immediate")
+def interview_face_flag_immediate(req: ImmediateFaceFlagRequest):
+    """Record high-severity face events immediately (e.g. multiple faces)."""
+    try:
+        flag = face_immediate_flag(req.event)
+        if flag:
+            aria_record_flag(req.candidate_id, flag)
+            return {"success": True, "flag_recorded": True}
+        return {"success": True, "flag_recorded": False}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# ── 9. VOICE CHUNK (multi-speaker detection) ─────────────────────────────
+@app.post("/api/interview/{candidate_id}/voice-chunk")
+async def interview_voice_chunk(candidate_id: str, audio: UploadFile = File(...)):
+    """Detect multiple voices via Azure speaker diarization (best-effort)."""
+    try:
+        candidate = get_candidate(candidate_id)
+        if not candidate:
+            raise HTTPException(status_code=404, detail="candidate not found")
+        session = candidate.get("interview_session") or {}
+
+        audio_bytes = await audio.read()
+        result = analyze_audio_chunk(audio_bytes,
+                                      candidate_id=candidate_id,
+                                      session_state=session)
+
+        session["voice_state"] = result.get("voice_state")
+        for f in result.get("anti_cheat_flags", []):
+            session.setdefault("anti_cheat_flags", []).append(f)
+
+        update_candidate(candidate_id, {"interview_session": session})
+        return {"success": True,
+                "voice_state":   result.get("voice_state"),
+                "speaker_count": result.get("speaker_count"),
+                "flags_added":   len(result.get("anti_cheat_flags", []))}
+    except HTTPException:
+        raise
+    except Exception as e:
+        # Voice analysis is best-effort — never block interview
+        import traceback; traceback.print_exc()
+        return {"success": False, "voice_state": "unavailable", "error": str(e)}
+
+
+# ── 10. GET BRIEFING (post-interview, for HR dashboard) ──────────────────
+@app.get("/api/interview/{candidate_id}/briefing")
+def interview_briefing(candidate_id: str):
+    try:
+        candidate = get_candidate(candidate_id)
+        if not candidate:
+            raise HTTPException(status_code=404, detail="candidate not found")
+        briefing = candidate.get("interview_briefing")
+        if not briefing:
+            return {"success": False, "message": "no briefing yet — interview not complete"}
+        return {"success": True, "briefing": briefing}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# ── 11. RESUME PARSE (trigger pre-parse of candidate resume) ─────────────
+@app.post("/api/candidates/{candidate_id}/parse-resume")
+def candidates_parse_resume(candidate_id: str):
+    """Force a (re)parse of the candidate's resume into ai_profile."""
+    try:
+        from agents.aria_interviewer.resume_analyzer import analyze_resume
+        candidate = get_candidate(candidate_id)
+        if not candidate:
+            raise HTTPException(status_code=404, detail="candidate not found")
+        resume_text = (
+            candidate.get("resume_text")
+            or candidate.get("parsed_resume_text")
+            or candidate.get("resume_content")
+            or ""
+        )
+        profile = analyze_resume(resume_text)
+        update_candidate(candidate_id, {"ai_profile": profile})
+        return {"success": True, "ai_profile": profile}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+
+# ═════════════════════════════════════════════════════════════════════════
+#  VIBE ENGINEERING CHALLENGE — AI-augmented coding test
+# ═════════════════════════════════════════════════════════════════════════
+
+class VibeStartRequest(BaseModel):
+    candidate_id: str
+
+class VibeAIHelpRequest(BaseModel):
+    candidate_id: str
+    message: str
+    code_context: str = ""
+
+class VibeSubmitRequest(BaseModel):
+    candidate_id: str
+    final_code:   str
+    test_results: List[Dict[str, Any]]
+
+class VibeSnapshotRequest(BaseModel):
+    candidate_id: str
+    code: str
+
+
+@app.post("/api/vibe/start")
+def vibe_start_endpoint(req: VibeStartRequest):
+    """Initialize a Vibe Engineering session — returns problem + starter code."""
+    try:
+        return {"success": True, **vibe_start(req.candidate_id)}
+    except ValueError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    except Exception as e:
+        import traceback; traceback.print_exc()
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/api/vibe/ai-help")
+def vibe_ai_help_endpoint(req: VibeAIHelpRequest):
+    """Candidate asks the AI assistant. Logged for evaluation."""
+    try:
+        return {"success": True, **vibe_ai_help(req.candidate_id, req.message, req.code_context)}
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/api/vibe/submit")
+def vibe_submit_endpoint(req: VibeSubmitRequest):
+    """Submit final code + test run results. Returns evaluation."""
+    try:
+        return {"success": True, **vibe_submit(req.candidate_id, req.final_code, req.test_results)}
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        import traceback; traceback.print_exc()
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/api/vibe/{candidate_id}/state")
+def vibe_state_endpoint(candidate_id: str):
+    try:
+        return {"success": True, **vibe_get_state(candidate_id)}
+    except ValueError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+
+
+@app.post("/api/vibe/snapshot")
+def vibe_snapshot_endpoint(req: VibeSnapshotRequest):
+    """Periodic code snapshot for anti-cheat tracking."""
+    try:
+        vibe_snapshot(req.candidate_id, req.code)
+        return {"success": True}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/api/vibe/send-link")
+def vibe_send_link(candidate_id: str = Form(...)):
+    """Send Vibe Engineering Challenge link to candidate after resume screening."""
+    try:
+        candidate = get_candidate(candidate_id)
+        if not candidate:
+            raise HTTPException(status_code=404, detail="Candidate not found")
+
+        from agents.communicator.agent import send_email
+        import urllib.parse
+
+        name = urllib.parse.quote(candidate.get("name", "Candidate"))
+        role = urllib.parse.quote(candidate.get("applied_role", ""))
+        vibe_url = f"http://localhost:3001?vibe={candidate_id}&name={name}&role={role}"
+
+        send_email(
+            to_address=candidate["email"],
+            subject=f"🛠️ Coding Challenge for {candidate.get('applied_role','')}",
+            body_html=f"""
+<div style="font-family:Arial,sans-serif;max-width:600px;margin:0 auto;padding:24px">
+<h2 style="color:#0f172a">Your Coding Challenge is Ready</h2>
+<p>Hi {candidate.get('name','')},</p>
+<p>Congratulations on passing the initial screening! The next step is a
+<strong>Vibe Engineering Challenge</strong> — a hands-on coding task where you
+can use AI assistance.</p>
+
+<table style="border-collapse:collapse;width:100%;margin:16px 0;font-size:14px">
+<tr style="background:#f8fafc"><td style="padding:10px;font-weight:700;width:140px">⏱ Duration</td><td style="padding:10px">30 minutes</td></tr>
+<tr><td style="padding:10px;font-weight:700">🤖 AI Assistant</td><td style="padding:10px">Yes — built-in (encouraged)</td></tr>
+<tr style="background:#f8fafc"><td style="padding:10px;font-weight:700">💻 Language</td><td style="padding:10px">Python (runs in your browser)</td></tr>
+<tr><td style="padding:10px;font-weight:700">📝 Format</td><td style="padding:10px">Fix a bug + add a small feature</td></tr>
+</table>
+
+<p><strong>What's evaluated:</strong></p>
+<ul>
+<li>Did you fix the bug correctly?</li>
+<li>Did the feature work?</li>
+<li>Was your code clean?</li>
+<li><strong>How well did you use the AI assistant?</strong></li>
+<li>Did you verify AI suggestions before using them?</li>
+</ul>
+
+<a href="{vibe_url}"
+   style="display:inline-block;background:linear-gradient(135deg,#5b8def,#3f6fd1);
+   color:#fff;padding:14px 32px;text-decoration:none;border-radius:11px;
+   font-weight:700;font-size:16px;margin:16px 0">
+   Start Challenge →
+</a>
+
+<p style="color:#94a3b8;font-size:12px;margin-top:20px">
+Complete within 3 days. Your interactions with the AI assistant are part of the evaluation.
+</p>
+</div>"""
+        )
+
+        update_candidate(candidate_id, {"status": "vibe_engineering_sent"})
+        return {"success": True}
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
 
 # ── Daily Digest ─────────────────────────────────────────────────
 

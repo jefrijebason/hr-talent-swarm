@@ -45,3 +45,4 @@ class Config:
 config = Config()
 ACTION_SECRET = os.getenv("ACTION_SECRET", "hr-swarm-secret-2026")
 PUBLIC_URL: str = os.getenv("PUBLIC_URL", "http://localhost:8000")
+ACTION_SECRET = os.getenv("ACTION_SECRET", "hr-swarm-demo-secret-key-2026")
